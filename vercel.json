@@ -11,7 +11,7 @@
     {
       "source": "/vendor/(.*)",
       "headers": [
-        { "key": "cache-control", "value": "public, max-age=300, must-revalidate" },
+        { "key": "cache-control", "value": "public, max-age=0, must-revalidate" },
         { "key": "access-control-allow-origin", "value": "*" }
       ]
     },

@@ -1,6 +1,6 @@
 {
   "name": "rollover-engine",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "private": true,
   "type": "module",
   "description": "RolloverEngine \u2014 an edge-aware multi-day rollover (compounding accumulator) system for sports betting. Scans a multi-sport market pool, de-vigs prices, blends a ratings model with market consensus, and builds the highest-win-probability slip that lands on your daily odds target.",

@@ -468,6 +468,16 @@ input[type="date"].input { color-scheme: dark; }
 .empty-state p { max-width: 54ch; margin: 0 auto 20px; font-size: 13.8px; }
 
 .toasts { position: fixed; right: 18px; bottom: 18px; z-index: 95; display: flex; flex-direction: column; gap: 9px; max-width: min(370px, calc(100vw - 36px)); }
+/* Start-failure box inside the setup modal. A toast can be missed or dismissed;
+   an error that stops a rollover from starting must still be on the screen when
+   the user looks up. Do not delete. */
+.setup-error {
+  margin: 12px 0 0; padding: 11px 13px; border: 1px solid var(--red);
+  border-left-width: 4px; border-radius: var(--radius-sm);
+  background: rgba(220, 60, 60, .12); color: #ffd9d9;
+  font-family: var(--mono); font-size: 12.4px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word;
+}
 .toast {
   background: linear-gradient(180deg, #16242a, #0e171b); border: 1px solid var(--line-2);
   border-left: 3px solid var(--green); border-radius: 10px; padding: 11px 14px;

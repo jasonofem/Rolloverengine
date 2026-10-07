@@ -5543,7 +5543,7 @@ const tzDateKey = __exp_19;
 
 const ENGINE_INFO = {
   name: 'RolloverEngine',
-  version: '1.1.0',
+  version: '1.1.2',
   signalWeights: SIGNAL_WEIGHTS,
   notes: [
     'Prices are de-vigged across all quoting books before anything else is measured.',

@@ -70,7 +70,7 @@ async function chooseTransport() {
     const st = await res.json();
     if (st?.runtime?.persistent !== false) return null; // a real server: keep using it
 
-    const mod = await import('./local-api.js?v=1.1.1'); // stamped: see index.html
+    const mod = await import('./local-api.js?v=1.1.2'); // stamped: see index.html
     transport = mod.localFetch;
 
     const info = mod.storageInfo();
@@ -1143,6 +1143,8 @@ function switchTab(name) {
 /* ══════════════════════════ setup modal ══════════════════════════ */
 
 function openSetup() {
+  const errBox = $('#setup-error');
+  if (errBox) { errBox.hidden = true; errBox.textContent = ''; }
   $('#modal-setup').hidden = false;
   updateSetupPreview();
 }
@@ -1193,11 +1195,24 @@ async function createRun() {
     reservePct: Number($('#f-reserve').value),
     startDay: $('#f-startday').value || undefined,
   };
+  const errBox = $('#setup-error');
+  errBox.hidden = true;
+  errBox.textContent = '';
   if (S.run?.status === 'active') {
     try { await api(`/api/runs/${S.run.id}/abandon`, { method: 'POST', body: { reason: 'replaced by new run' } }); } catch {}
   }
   const btn = $('#btn-create-run');
+  const btnLabel = btn.textContent;
   btn.disabled = true;
+  btn.textContent = 'Starting…';
+  /* If this ever hangs instead of failing, say so instead of leaving a dead
+   * button: after 20s the modal explains itself and points at the console. */
+  const watchdog = setTimeout(() => {
+    if (btn.disabled) {
+      errBox.hidden = false;
+      errBox.textContent = 'Still starting after 20 seconds — something is stuck, not just slow. Open the browser console (F12 → Console) and screenshot any red text; that is the actual error.';
+    }
+  }, 20000);
   try {
     await api('/api/settings', { method: 'POST', body: { currency: body.currency } });
     const { run, projection } = await api('/api/runs', { method: 'POST', body });
@@ -1211,9 +1226,15 @@ async function createRun() {
     if (day1.slip) toast('Rollover started', `Day 1: ${day1.slip.legCount} legs at ${day1.slip.odds.toFixed(2)} · ${pct(day1.slip.winProbPct)} modelled`, 'ok', 7000);
     else toast('Rollover created', 'The engine found nothing above the edge floor for day 1 — try a rescan or a different start date.', 'warn', 8000);
   } catch (err) {
+    /* Toasts fly away; this box stays until the modal closes. */
+    console.error('[rollover] start failed:', err);
+    errBox.hidden = false;
+    errBox.textContent = `Could not start the rollover: ${err && err.message ? err.message : err}`;
     toast('Could not start the run', err.message, 'err');
   } finally {
+    clearTimeout(watchdog);
     btn.disabled = false;
+    btn.textContent = btnLabel;
   }
 }
 
