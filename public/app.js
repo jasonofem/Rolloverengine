@@ -70,7 +70,7 @@ async function chooseTransport() {
     const st = await res.json();
     if (st?.runtime?.persistent !== false) return null; // a real server: keep using it
 
-    const mod = await import('./local-api.js');
+    const mod = await import('./local-api.js?v=1.1.1'); // stamped: see index.html
     transport = mod.localFetch;
 
     const info = mod.storageInfo();
@@ -194,6 +194,7 @@ function applySettingsToForms() {
   $('#s-edge-val').textContent = `${(s.minEdgePerLeg * 100).toFixed(1)}%`;
   $('#s-maxlegs').value = s.maxLegs;
   $('#s-apikey').value = s.oddsApi?.key || '';
+  $('#s-manual').value = (s.manualOdds || []).map((l) => JSON.stringify(l)).join('\n');
   const today = new Date().toISOString().slice(0, 10);
   $('#f-startday').value = today;
   $('#f-startday').min = today;
@@ -1227,6 +1228,23 @@ async function saveSettings() {
     maxLegs: Number($('#s-maxlegs').value),
     oddsApi: { key: $('#s-apikey').value.trim(), sports: [] },
   };
+  const pasted = $('#s-manual').value.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (pasted.length) {
+    try {
+      body.manualOdds = pasted.map((line, i) => {
+        const e = JSON.parse(line);
+        if (!e?.outcomes?.length || e.outcomes.some((o) => !(Number(o.odds) > 1))) {
+          throw new Error(`line ${i + 1}: every outcome needs decimal odds above 1`);
+        }
+        return e;
+      });
+    } catch (err) {
+      toast('Pasted odds not saved', err.message, 'err', 9000);
+      return;
+    }
+  } else {
+    body.manualOdds = [];
+  }
   try {
     const { settings } = await api('/api/settings', { method: 'POST', body });
     S.settings = settings;
@@ -1294,6 +1312,86 @@ $('#btn-goto-slip').addEventListener('click', () => switchTab('slip'));
 $('#btn-create-run').addEventListener('click', createRun);
 $('#btn-settings').addEventListener('click', () => ($('#modal-settings').hidden = false));
 $('#btn-save-settings').addEventListener('click', saveSettings);
+
+/* ── LIVE odds ──────────────────────────────────────────────────── *
+ * Deliberately bypasses the transport seam: a live scan is stateless, so it
+ * belongs to the server even when your runs live in localStorage. In the tab
+ * the engine has no business holding your API key and calling bookmakers
+ * direct — and browser CORS would refuse most of it anyway.
+ * ------------------------------------------------------------------ */
+async function liveScan() {
+  const btn = $('#btn-live-scan');
+  const slot = $('#live-slot');
+  btn.disabled = true;
+  btn.textContent = '⚡ fetching…';
+  slot.innerHTML = '';
+  try {
+    const res = await fetch('/api/scan/live', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        date: $('#market-date').value || undefined,
+        odds: S.settings?.targetOdds,
+        tolerance: S.settings?.tolerance,
+        apiKey: $('#s-apikey')?.value?.trim() || S.settings?.oddsApi?.key || '',
+      }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) { renderLiveError(j, res.status); return; }
+    renderLive(j);
+  } catch (err) {
+    renderLiveError({ error: `Could not reach the live scanner: ${err.message}` }, 0);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚡ Scan LIVE';
+  }
+}
+
+function renderLive(j) {
+  const d = j.diagnostics || {};
+  const best = j.builder?.ok ? j.builder.best : null;
+  const quota = j.quota ? ` · ${j.quota.used ?? '?'} requests used, ${j.quota.remaining ?? '?'} left this month` : '';
+  const leagues = (j.leagues || [])
+    .map((l) => `<span class="live-league${l.ok && l.fixtures ? ' on' : ''}" title="${esc(String(l.status ?? l.fixtures ?? ''))}">${esc(l.league)}${l.ok && l.fixtures ? ` ${l.fixtures}` : ''}</span>`)
+    .join('');
+  const legs = best?.legs?.length
+    ? `<table class="table"><thead><tr><th>Fixture</th><th>Market</th><th>Pick</th><th>Odds</th><th>Book</th><th>Model</th><th>Edge</th><th>Conf</th></tr></thead><tbody>
+       ${best.legs.map((l) => `<tr>
+         <td>${esc(l.home)} v ${esc(l.away)}<div class="dim" style="font-size:11px">${esc(l.league)}</div></td>
+         <td>${esc(l.market)}</td><td>${esc(l.pick)}</td>
+         <td class="num">${l.odds.toFixed(2)}</td><td>${esc(l.book)}</td>
+         <td class="num">${(l.modelProbPct ?? (l.modelProb * 100)).toFixed(1)}%</td>
+         <td class="num ${l.edgePct > 0 ? 'pos' : 'neg'}">${l.edgePct > 0 ? '+' : ''}${l.edgePct}%</td>
+         <td class="num">${((l.confidence ?? 0) * 100).toFixed(0)}%</td></tr>`).join('')}
+       </tbody></table>`
+    : `<p class="live-note">Real prices arrived but nothing inside your odds band made a slip today. That is a real answer, not a failure — thin cards happen.</p>`;
+  $('#live-slot').innerHTML = `<div class="live-panel">
+    <div class="live-head"><span class="live-badge">⚡ live prices</span>
+      <span class="live-quota">${esc(j.dayKey)} · ${d.events ?? 0} fixtures · ${d.bookCount ?? 0} books · ${d.pricesQuoted ?? 0} quotes${quota}</span></div>
+    <div class="live-leagues">${leagues}</div>
+    ${legs}
+    <p class="live-note">These are real bookmaker prices, de-vigged and blended with the same weights the Lab justified.
+    Head-to-head markets only. <b>truthProb and calibration are null on purpose</b> — with live fixtures nobody knows
+    the answer yet, so nothing here can flatter itself. Advisory slip: run tracking still settles against the simulator.</p>
+  </div>`;
+}
+
+function renderLiveError(j, status) {
+  const hint = status === 400
+    ? 'Paste your The Odds API key in Settings (or set ODDS_API_KEY on the server). Until then every scan is simulated and says so.'
+    : status === 502
+      ? 'The key worked but no league returned fixtures in this window — off-season, or the quota ran out. The league chips below show who answered.'
+      : 'The live scanner could not answer.';
+  const leagues = (j.leagues || []).map((l) => `<span class="live-league">${esc(l.league)}: ${esc(String(l.status ?? '—'))}</span>`).join('');
+  $('#live-slot').innerHTML = `<div class="live-panel err">
+    <div class="live-head"><span class="live-badge">live scan failed</span><span class="live-quota">${esc(j.code || '')}</span></div>
+    <p class="live-note"><b>${esc(j.error || 'unknown error')}</b><br>${esc(hint)}</p>
+    ${leagues ? `<div class="live-leagues">${leagues}</div>` : ''}
+  </div>`;
+  toast('Live scan failed', j.error || 'see the market tab', 'err', 9000);
+}
+
+$('#btn-live-scan').addEventListener('click', liveScan);
 $('#btn-rescan').addEventListener('click', loadMarket);
 $('#market-date').addEventListener('change', loadMarket);
 $('#btn-run-lab').addEventListener('click', runLab);

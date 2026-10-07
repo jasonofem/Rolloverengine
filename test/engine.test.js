@@ -1432,6 +1432,106 @@ describe('live odds — real quotes, and never a silent simulation', () => {
   });
 });
 
+describe('live odds — quota, multi-sport, and pasted prices', () => {
+  test('fetchOddsApi captures the quota headers and queries every sport on the board', async () => {
+    const { fetchOddsApi } = await import('../lib/scan.js');
+    const urls = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      urls.push(String(u));
+      const key = /sports\/([a-z_]+)\/odds/.exec(u)?.[1];
+      if (key === 'cricket_odi') return { ok: false, status: 404, headers: { get: () => null } };
+      return {
+        ok: true,
+        headers: { get: (h) => (h === 'x-requests-remaining' ? '431' : h === 'x-requests-used' ? '69' : null) },
+        json: async () => [],
+      };
+    };
+    try {
+      const { games, quota, leagues } = await fetchOddsApi(null, 'k', { daysAhead: 2 });
+      assert.deepEqual(games, []);
+      assert.equal(quota.remaining, 431, 'the allowance is surfaced, not swallowed');
+      assert.equal(quota.used, 69);
+      const sports = new Set(urls.map((u) => /sports\/([a-z_]+)\/odds/.exec(u)[1]));
+      for (const k of ['basketball_nba', 'tennis_atp', 'tennis_wta', 'mma_mixed_martial_arts', 'icehockey_nhl', 'baseball_mlb']) {
+        assert.ok(sports.has(k), `${k} must be on the board — the engine is not football-only`);
+      }
+      assert.ok(sports.size >= 20, `expected a broad board, got ${sports.size}`);
+      const cricket = leagues.find((l) => l.key === 'cricket_odi');
+      assert.equal(cricket.ok, false, 'an out-of-season or unknown key is recorded, not fatal');
+      assert.equal(cricket.status, 404);
+      const nba = leagues.find((l) => l.key === 'basketball_nba');
+      assert.equal(nba.ok, true);
+      assert.equal(nba.fixtures, 0);
+    } finally { globalThis.fetch = real; }
+  });
+
+  test('a sports subset in settings trims the board (and the credit burn)', async () => {
+    const { fetchOddsApi } = await import('../lib/scan.js');
+    const urls = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = async (u) => { urls.push(String(u)); return { ok: true, headers: { get: () => null }, json: async () => [] }; };
+    try {
+      await fetchOddsApi(['basketball_nba', 'tennis_atp'], 'k', {});
+      assert.equal(urls.length, 2, 'one request per requested key — the free tier is 500 a month');
+    } finally { globalThis.fetch = real; }
+  });
+
+  test('pasted prices become a real slip: settings → scan → builder', async () => {
+    const { createApi } = await import('../lib/http-core.js');
+    const { createMemoryStore } = await import('../lib/memory-store.js');
+    const api = createApi({ store: createMemoryStore(), env: {}, persistent: false });
+    /* Two fixtures, because a rollover combines games: minLegs is 2 by design
+     * ("rollover = combine"), and one pasted match can never be a slip. A real
+     * paste is a board of several matches, which is what this imitates. */
+    const mk = (home, away, league, h, d, a) => ({
+      home, away, sport: 'football', league, tier: 2,
+      kickoff: new Date(Date.now() + 30 * 3600e3).toISOString(),
+      market: 'Match Result', marketKey: `${home}-${away}`.toLowerCase(),
+      outcomes: [
+        { pick: home, odds: h, book: 'SportyBet' },
+        { pick: 'Draw', odds: d, book: 'SportyBet' },
+        { pick: away, odds: a, book: 'SportyBet' },
+      ],
+    });
+    const entries = [
+      mk('Rangers', 'Enyimba', 'NPFL', 1.42, 4.2, 6.5),
+      mk('Kano Pillars', 'Shooting Stars', 'NPFL', 1.45, 4.0, 6.2),
+    ];
+    let r = await api({ method: 'POST', pathname: '/api/settings', body: { manualOdds: entries, provider: 'manual' } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.settings.manualOdds.length, 2, 'the paste survives a save');
+
+    const date = new Date(Date.now() + 30 * 3600e3).toISOString().slice(0, 10);
+    r = await api({ method: 'GET', pathname: '/api/scan', query: new URLSearchParams(`date=${date}&odds=2.0&provider=manual`) });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.provider.used, 'manual', 'pasted prices are used, not simulated over');
+    assert.equal(r.body.provider.fellBack, false);
+    const leg = r.body.topLegs.find((l) => l.home === 'Rangers');
+    assert.ok(leg, 'the pasted fixture is priced');
+    assert.equal(leg.book, 'SportyBet');
+    assert.equal(leg.viewSource, 'pasted-single-book');
+    assert.ok(r.body.builder.ok, r.body.builder.message);
+    const best = r.body.builder.best;
+    assert.equal(best.legCount, 2, 'two pasted games combined into the accumulator');
+    assert.ok(best.odds >= 1.9 && best.odds <= 2.1, `combined odds ${best.odds} inside the band`);
+    assert.ok(best.legs.every((l) => l.book === 'SportyBet'), 'every leg is YOUR price, not a simulated one');
+  });
+
+  test('garbage in the paste box is refused with a diagnosis, not stored half-parsed', async () => {
+    const { createApi } = await import('../lib/http-core.js');
+    const { createMemoryStore } = await import('../lib/memory-store.js');
+    const api = createApi({ store: createMemoryStore(), env: {}, persistent: false });
+    const r = await api({ method: 'POST', pathname: '/api/settings', body: { manualOdds: [{ home: 'A', away: 'B', outcomes: [{ pick: 'A', odds: 0.5 }, { pick: 'B', odds: 0.8 }] }] } });
+    assert.equal(r.status, 200, 'the store accepts what it is given…');
+    const date = new Date(Date.now() + 30 * 3600e3).toISOString().slice(0, 10);
+    const scan = await api({ method: 'GET', pathname: '/api/scan', query: new URLSearchParams(`date=${date}&provider=manual`) });
+    assert.equal(scan.body.provider.used, 'sim', '…but odds below 1 cannot price anything, so it falls back');
+    assert.equal(scan.body.provider.fellBack, true);
+    assert.match(scan.body.provider.reason, /could not be used/i);
+  });
+});
+
 describe('API surface — provider honesty and malformed input', () => {
   const mkApi = async (env = {}) => {
     const { createApi } = await import('../lib/http-core.js');
@@ -1488,5 +1588,59 @@ describe('API surface — provider honesty and malformed input', () => {
       const r = await api({ method: 'GET', pathname: '/api/scan', query: bad });
       assert.equal(r.status, 200, `query=${JSON.stringify(bad)}`);
     }
+  });
+});
+
+describe('the dashboard as a browser sees it', () => {
+  /* Everything else in this file runs against modules and HTTP. These two run
+   * against the actual stylesheet and markup, because the bug they guard was
+   * invisible to every other kind of test: it only exists once a real browser
+   * computes the cascade. */
+  const css = readFileSync(join(process.cwd(), 'public', 'app.css'), 'utf8');
+  const html = readFileSync(join(process.cwd(), 'public', 'index.html'), 'utf8');
+
+  test('the [hidden] attribute is defended against author display rules', () => {
+    /* [hidden] is display:none only in the UA stylesheet. Any author display
+     * rule — .modal-backdrop's grid, .btn's inline-flex — outranks it, so every
+     * hidden element rendered anyway and the empty result-modal backdrop dimmed
+     * and blurred the entire app, swallowing all clicks. One !important author
+     * rule restores the attribute's meaning. */
+    assert.match(
+      css,
+      /\[hidden\]\s*\{\s*display:\s*none\s*!important/,
+      'app.css must keep `[hidden] { display: none !important; }` — see the comment above it',
+    );
+  });
+
+  test('every element that relies on hidden has an author display rule that would break it', () => {
+    /* This is the tripwire in the other direction: if someone "cleans up" the
+     * !important rule, this test lists exactly which elements would start
+     * rendering while hidden, so the failure message is the diagnosis. */
+    const hiddenEls = [...html.matchAll(/<[^>]*\bhidden[^>]*>/g)].map((m) => m[0])
+      .filter((tag) => !/aria-hidden/.test(tag));
+    assert.ok(hiddenEls.length >= 5, 'the dashboard uses hidden in several places');
+    for (const tag of hiddenEls) {
+      const cls = /class="([^"]+)"/.exec(tag)?.[1]?.split(/\s+/).filter(Boolean) || [];
+      const id = /id="([^"]+)"/.exec(tag)?.[1];
+      const offenders = cls.filter((c) => new RegExp(`\\.${c}[^{]*\\{[^}]*display:`).test(css));
+      if (offenders.length) {
+        assert.match(
+          css,
+          /\[hidden\]\s*\{\s*display:\s*none\s*!important/,
+          `#${id} (.${offenders.join(', .')}) sets display in author CSS and needs the [hidden] guard`,
+        );
+      }
+    }
+  });
+
+  test('modal backdrops are the last word in stacking, above the topbar and toasts-excepted', () => {
+    /* The dim wall in the bug report was a backdrop. Keep its contract explicit:
+     * fixed, full viewport, and above ordinary page chrome. */
+    const bd = /\.modal-backdrop\s*\{([^}]*)\}/.exec(css)[1];
+    assert.match(bd, /position:\s*fixed/);
+    assert.match(bd, /inset:\s*0/);
+    const z = Number(/z-index:\s*(\d+)/.exec(bd)[1]);
+    const topbarZ = Number(/z-index:\s*(\d+)/.exec(/\.topbar\s*\{([^}]*)\}/.exec(css)[1])[1]);
+    assert.ok(z > topbarZ, 'a modal must dim the topbar, not slide under it');
   });
 });

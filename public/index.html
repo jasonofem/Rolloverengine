@@ -6,7 +6,10 @@
 <title>RolloverEngine — edge-aware 7-day rollover system</title>
 <meta name="description" content="Set a starting stake, a daily odds target and a number of days. The engine scans a multi-sport market, de-vigs the prices, keeps only the legs carrying real edge, and builds the highest-probability slip that lands on your target." />
 <meta name="theme-color" content="#070a0c" />
-<link rel="stylesheet" href="/app.css" />
+<!-- ASSET STAMP: caching proxies (including preview iframes) key on the full URL,
+     so a query bump is the only reliable way to invalidate a cached app.css or
+     app.js. Bump v= whenever either file changes. -->
+<link rel="stylesheet" href="/app.css?v=1.1.1" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2308110d'/%3E%3Cpath d='M8 22l5-7 4 4 7-9' stroke='%233ddc97' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -102,8 +105,10 @@
         <div class="panel-tools">
           <input type="date" id="market-date" class="input input-sm" />
           <button class="btn btn-sm btn-ghost" id="btn-rescan">Rescan</button>
+          <button class="btn btn-sm btn-live" id="btn-live-scan" title="Fetch real prices from The Odds API and price them with the same blend the Lab justified">⚡ Scan LIVE</button>
         </div>
       </div>
+      <div id="live-slot"></div>
       <div class="scan-grid" id="scan-grid"></div>
     </div>
 
@@ -263,6 +268,13 @@
         <label class="field"><span>Max legs per slip</span><input type="number" id="s-maxlegs" value="6" min="1" max="10" class="input" /></label>
         <label class="field"><span>The Odds API key <em class="hint">optional</em></span><input type="password" id="s-apikey" placeholder="leave blank to use the simulator" class="input" /></label>
       </div>
+      <label class="field"><span>Real odds you paste yourself <em class="hint">SportyBet, a shop board, anywhere</em></span>
+        <textarea id="s-manual" class="input" rows="5" spellcheck="false"
+          placeholder='One JSON object per line, e.g.&#10;{"home":"Arsenal","away":"Everton","sport":"football","league":"NPFL","kickoff":"2026-10-10T16:00:00Z","market":"Match Result","outcomes":[{"pick":"Arsenal","odds":1.42,"book":"SportyBet"},{"pick":"Draw","odds":4.6,"book":"SportyBet"},{"pick":"Everton","odds":7.5,"book":"SportyBet"}]}'></textarea>
+        <em class="hint">The Odds API does not carry SportyBet or most Nigerian books — no public feed exists for them.
+        Paste their prices here and the engine de-vigs and blends them exactly like API prices. Set provider to
+        "Manual odds entry" to scan against these instead of the simulator.</em>
+      </label>
       <p class="foot-note">
         <b>On the edge floor.</b> Counter-intuitively, raising it usually makes a rollover
         <i>worse</i>. Positive-edge legs are disproportionately longshots, so a hard floor starves the
@@ -290,6 +302,6 @@
   <span class="footer-warn">18+ · Bet with money you can afford to lose · The house always has the structural advantage; the edge here is measured, not promised.</span>
 </footer>
 
-<script src="/app.js" type="module"></script>
+<script src="/app.js?v=1.1.1" type="module"></script>
 </body>
 </html>

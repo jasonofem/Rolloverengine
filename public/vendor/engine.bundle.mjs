@@ -2598,7 +2598,11 @@ function buildRolloverSlip(legs, opts = {}) {
    */
   const pool = [];
   for (const l of legs) {
-    if (l.confidence < o.minConfidence) {
+    /* A pasted single-book leg can never earn cross-book confidence — one book
+     * has no agreement to measure. Its confidence is a flat tier label instead,
+     * so the cross-book floor must not be the thing that silently deletes the
+     * only real prices you have. */
+    if (l.confidence < o.minConfidence && l.viewSource !== 'pasted-single-book') {
       report.rejected.confidence++;
       continue;
     }
@@ -3062,7 +3066,13 @@ const DAY_CACHE_LIMIT = 24;
 function scanDay(dayKey, opts = {}) {
   const requested = opts.provider || 'sim';
   if (requested === 'manual') {
-    if (opts.manualOdds?.length) return stamp(scanManual(dayKey, opts), requested, 'manual', null);
+    const usable = (opts.manualOdds || []).filter(
+      (e) => e?.outcomes?.length >= 2 && e.outcomes.every((o) => Number(o.odds) > 1));
+    if (opts.manualOdds?.length && !usable.length) {
+      return stamp(scanSim(dayKey, opts), requested, 'sim',
+        'Your pasted odds could not be used — every market needs at least two outcomes priced above 1.00. These prices are simulated.');
+    }
+    if (usable.length) return stamp(scanManual(dayKey, { ...opts, manualOdds: usable }), requested, 'manual', null);
     /* You cannot silently answer a request for real prices with invented ones.
      * The user chose "paste your bookmaker's odds"; if nothing was pasted the
      * honest answer is a simulator run that says so out loud. */
@@ -3124,13 +3134,18 @@ async function scanDayLive(dayKey, opts = {}) {
     e.code = 'NO_KEY';
     throw e;
   }
-  const games = await fetchOddsApi(opts.sports, apiKey, { daysAhead: opts.daysAhead ?? 2 });
+  const fetched = await fetchOddsApi(opts.sports, apiKey, { daysAhead: opts.daysAhead ?? 2 });
+  const games = fetched.games;
   if (!games.length) {
     const e = new Error('The Odds API returned no games. Check the key, the remaining quota, and that these leagues have fixtures in the window.');
     e.code = 'NO_GAMES';
     throw e;
   }
   const scan = stamp(scanLiveGames(dayKey, games, opts), 'oddsapi', 'oddsapi', null);
+  scan.diagnostics.quota = fetched.quota;
+  scan.diagnostics.leagues = fetched.leagues;
+  scan.diagnostics.leaguesQueried = fetched.leagues.length;
+  scan.diagnostics.leaguesWithFixtures = fetched.leagues.filter((l) => l.ok && l.fixtures > 0).length;
   const builderOpts = { ...DEFAULT_BUILDER_OPTS, ...(opts.builder || {}) };
   return {
     scan,
@@ -3139,6 +3154,8 @@ async function scanDayLive(dayKey, opts = {}) {
     legs: scan.legs,
     events: scan.events,
     diagnostics: scan.diagnostics,
+    quota: fetched.quota,
+    leagues: fetched.leagues,
   };
 }
 
@@ -3328,6 +3345,11 @@ function scanLiveGames(dayKey, games, opts = {}) {
   };
 }
 
+/** Confidence band label without pulling in the cross-book confidence() maths. */
+function confBandless(c) {
+  return c >= 0.8 ? 'A' : c >= 0.65 ? 'B' : c >= 0.5 ? 'C' : 'D';
+}
+
 /**
  * A flat-ish prior over whatever outcome names a book actually quoted.
  *
@@ -3363,6 +3385,13 @@ function outcomePrior(names, homeName) {
  */
 function scanManual(dayKey, opts = {}) {
   const entries = opts.manualOdds || [];
+  /* A pasted board is one book. Every cross-book statistic this engine normally
+   * leans on — agreement, sharp subset, line shopping — is structurally absent,
+   * so legs are labelled `viewSource: 'pasted-single-book'` and carry a flat,
+   * tier-based confidence instead of a cross-book score that could never be
+   * earned. The builder reads the label and skips the gates that assume more
+   * books than you pasted. What remains is still real: the de-vigged fair
+   * probabilities and the win-probability optimiser. */
   const legs = [];
   const pricedEvents = [];
   for (const [i, entry] of enumerate(entries)) {
@@ -3413,6 +3442,11 @@ function scanManual(dayKey, opts = {}) {
     };
     pricedEvents.push(ev);
     legs.push(...extractLegs(ev));
+  }
+  for (const l of legs) {
+    l.viewSource = 'pasted-single-book';
+    l.confidence = round(l.tier <= 1 ? 0.66 : l.tier === 2 ? 0.58 : 0.48, 3);
+    l.band = confBandless(l.confidence);
   }
   return {
     dayKey,
@@ -3468,36 +3502,80 @@ function scanForDay(dayKey, runConfig, overrides = {}) {
  * Live provider (The Odds API) — async path used by the server
  * ------------------------------------------------------------------ */
 
+/* Every league the live path will query, across every sport the books price.
+ *
+ * The engine is not a football model that tolerates other sports — it is a
+ * pricing model, and de-vigging plus sharp-weighting works on any market where
+ * several books disagree. Football carries the most ratings priors, but a
+ * two-book NBA line de-vigs exactly like a two-book Eredivisie line.
+ *
+ * Keys the API does not recognise (or that are out of season) return an error
+ * and are skipped with a recorded reason, so a broad list costs at most one
+ * request per key and never breaks a scan. The free Odds-API tier is 500
+ * requests/month and one live scan costs one request per key below — the quota
+ * is captured from the response headers and shown in the UI, so you can watch
+ * it burn and trim `settings.oddsApi.sports` to the keys you actually bet. */
 const SPORT_MAP = [
+  // football — the deep cards
   { key: 'soccer_epl', sport: 'football', league: 'Premier League', tier: 1, noise: 0.05, base: 1.42 },
   { key: 'soccer_spain_la_liga', sport: 'football', league: 'La Liga', tier: 1, noise: 0.05, base: 1.3 },
   { key: 'soccer_italy_serie_a', sport: 'football', league: 'Serie A', tier: 1, noise: 0.05, base: 1.34 },
   { key: 'soccer_germany_bundesliga', sport: 'football', league: 'Bundesliga', tier: 1, noise: 0.05, base: 1.58 },
   { key: 'soccer_france_ligue_one', sport: 'football', league: 'Ligue 1', tier: 1, noise: 0.05, base: 1.38 },
+  { key: 'soccer_uefa_champs_league', sport: 'football', league: 'Champions League', tier: 1, noise: 0.04, base: 1.5 },
+  { key: 'soccer_uefa_europa_league', sport: 'football', league: 'Europa League', tier: 2, noise: 0.06, base: 1.44 },
   { key: 'soccer_brazil_campeonato', sport: 'football', league: 'Brasileirão', tier: 2, noise: 0.07, base: 1.16 },
+  { key: 'soccer_portugal_primeira_liga', sport: 'football', league: 'Primeira Liga', tier: 2, noise: 0.06, base: 1.3 },
+  { key: 'soccer_netherlands_eredivisie', sport: 'football', league: 'Eredivisie', tier: 2, noise: 0.06, base: 1.5 },
+  { key: 'soccer_turkey_super_lig', sport: 'football', league: 'Süper Lig', tier: 2, noise: 0.07, base: 1.4 },
+  { key: 'soccer_usa_mls', sport: 'football', league: 'MLS', tier: 2, noise: 0.07, base: 1.5 },
+  // basketball — two-way markets, no draw, tightest lines in betting
   { key: 'basketball_nba', sport: 'basketball', league: 'NBA', tier: 1, noise: 0.045, base: 114, sigma: 11.6 },
-  { key: 'baseball_mlb', sport: 'baseball', league: 'MLB', tier: 1, noise: 0.05, base: 4.55, sigma: 3.5 },
+  { key: 'basketball_euroleague', sport: 'basketball', league: 'EuroLeague', tier: 2, noise: 0.06, base: 84, sigma: 10 },
+  { key: 'basketball_wnba', sport: 'basketball', league: 'WNBA', tier: 2, noise: 0.07, base: 82, sigma: 11 },
+  // tennis — player form moves these more than any team sport
   { key: 'tennis_atp', sport: 'tennis', league: 'ATP', tier: 1, noise: 0.055, scale: 7.5 },
+  { key: 'tennis_wta', sport: 'tennis', league: 'WTA', tier: 2, noise: 0.065, scale: 7.5 },
+  // and the rest of the board
+  { key: 'baseball_mlb', sport: 'baseball', league: 'MLB', tier: 1, noise: 0.05, base: 4.55, sigma: 3.5 },
+  { key: 'icehockey_nhl', sport: 'icehockey', league: 'NHL', tier: 1, noise: 0.05, base: 3.1, sigma: 1.35 },
+  { key: 'mma_mixed_martial_arts', sport: 'mma', league: 'MMA / UFC', tier: 2, noise: 0.08, scale: 6 },
+  { key: 'cricket_odi', sport: 'cricket', league: 'Cricket (ODI)', tier: 2, noise: 0.07, base: 260, sigma: 30 },
+  { key: 'aussierules_afl', sport: 'aussierules', league: 'AFL', tier: 2, noise: 0.07, base: 86, sigma: 12 },
+  { key: 'rugbyleague_nrl', sport: 'rugbyleague', league: 'NRL', tier: 2, noise: 0.07, base: 24, sigma: 6 },
 ];
 
 async function fetchOddsApi(sports, apiKey, { daysAhead = 2 } = {}) {
-  const out = [];
+  const games = [];
+  const quota = { remaining: null, used: null };
+  const leagues = [];
   const until = new Date(Date.now() + daysAhead * 86400000).toISOString().slice(0, 10);
   for (const s of SPORT_MAP) {
     if (sports && sports.length && !sports.includes(s.key)) continue;
     const url =
       `https://api.the-odds-api.com/v4/sports/${s.key}/odds/?apiKey=${encodeURIComponent(apiKey)}` +
-      `&regions=eu,uk&markets=h2h,totals,spreads&dateFormat=iso&oddsFormat=decimal&endDate=${until}`;
+      `&regions=eu,uk,us&markets=h2h,totals,spreads&dateFormat=iso&oddsFormat=decimal&endDate=${until}`;
     try {
       const res = await fetch(url, { headers: { accept: 'application/json' } });
-      if (!res.ok) continue;
+      /* The API reports your allowance in headers on every answer. Capture it
+       * once so the dashboard can show what a scan cost you — a free tier dies
+       * quietly otherwise, and "no games today" looks identical to "no key". */
+      if (quota.remaining === null) {
+        quota.remaining = Number(res.headers?.get?.('x-requests-remaining') ?? NaN) || null;
+        quota.used = Number(res.headers?.get?.('x-requests-used') ?? NaN) || null;
+      }
+      if (!res.ok) {
+        leagues.push({ key: s.key, league: s.league, sport: s.sport, ok: false, status: res.status });
+        continue;
+      }
       const json = await res.json();
-      for (const g of json) out.push(normaliseOddsApiGame(g, s));
-    } catch {
-      /* network-restricted or bad key — skip this league */
+      leagues.push({ key: s.key, league: s.league, sport: s.sport, ok: true, fixtures: json.length });
+      for (const g of json) games.push(normaliseOddsApiGame(g, s));
+    } catch (err) {
+      leagues.push({ key: s.key, league: s.league, sport: s.sport, ok: false, status: err?.message || 'network' });
     }
   }
-  return out;
+  return { games, quota, leagues };
 }
 
 function normaliseOddsApiGame(g, meta) {
@@ -5758,8 +5836,11 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
       });
       const { builder } = scanForDay(date, {
         tz: settings.tz,
+        provider: wantProvider,
         eventsPerDay,
         marketInefficiency: settings.marketInefficiency,
+        manualOdds: settings.manualOdds,
+        apiKey: q.get('apiKey') || settings.oddsApi?.key || env.ODDS_API_KEY || '',
         builder: {
           targetOdds: Number(q.get('odds') || settings.targetOdds),
           tolerance: settings.tolerance,
@@ -5979,7 +6060,7 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
         const res = await scanDayLive(date, {
           tz: settings.tz,
           apiKey: key,
-          sports: src.sports,
+          sports: src.sports || settings.oddsApi?.sports || [],
           daysAhead: Number(src.daysAhead || 2),
           builder: {
             targetOdds: Number(src.odds || settings.targetOdds),
@@ -5995,6 +6076,8 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
             scan: toPlain(res.scan),
             builder: toPlain(res.builder),
             diagnostics: toPlain(res.diagnostics),
+            quota: res.quota || null,
+            leagues: toPlain(res.leagues || []),
             truthKnown: false,
             note: 'Live prices. truthProb and calibration are null on purpose — with real fixtures nobody knows the answer yet.',
           },
@@ -6015,8 +6098,16 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
         };
       }
       try {
-        const games = await fetchOddsApi(body.sports, key, { daysAhead: Number(body.daysAhead || 2) });
-        return { status: 200, body: { count: games.length, games: games.slice(0, 60) } };
+        const fetched = await fetchOddsApi(body.sports, key, { daysAhead: Number(body.daysAhead || 2) });
+        return {
+          status: 200,
+          body: {
+            count: fetched.games.length,
+            games: fetched.games.slice(0, 60),
+            quota: fetched.quota,
+            leagues: fetched.leagues,
+          },
+        };
       } catch (err) {
         return { status: 502, body: { error: `Live odds fetch failed: ${err.message}` } };
       }
@@ -6077,6 +6168,10 @@ const DEFAULT_SETTINGS = {
    * a reporting number, and the builder relaxes it in tiers when it bites. */
   minEdgePerLeg: 0,
   maxLegs: 6,
+  /* Real prices you pasted yourself (SportyBet screenshot transcription, a
+   * telegram tip with numbers, whatever). Empty means "nothing pasted", which
+   * the scan reports as a fallback rather than pretending to use them. */
+  manualOdds: [],
 };
 
 /** What the run list shows. Cheap enough to compute on every read. */
