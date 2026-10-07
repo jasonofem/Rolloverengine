@@ -1,0 +1,48 @@
+{
+  "name": "rollover-engine",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RolloverEngine \u2014 an edge-aware multi-day rollover (compounding accumulator) system for sports betting. Scans a multi-sport market pool, de-vigs prices, blends a ratings model with market consensus, and builds the highest-win-probability slip that lands on your daily odds target.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "cli": "node bin/rollover.mjs",
+    "test": "node --test test/*.test.js",
+    "bundle": "node scripts/bundle.mjs --check",
+    "bundle:only": "node scripts/bundle.mjs",
+    "build": "npm run bundle && node scripts/vercel-dist.mjs",
+    "preview:static": "node scripts/preview-static.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "rollover",
+    "accumulator",
+    "sports-betting",
+    "expected-value",
+    "kelly",
+    "poisson",
+    "monte-carlo",
+    "edge"
+  ],
+  "license": "MIT",
+  "exports": {
+    ".": "./lib/rollover.js",
+    "./http-core": "./lib/http-core.js",
+    "./local-api": "./public/local-api.js",
+    "./store": "./lib/store.js",
+    "./memory-store": "./lib/memory-store.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "public",
+    "api",
+    "server",
+    "bin",
+    "README.md"
+  ]
+}

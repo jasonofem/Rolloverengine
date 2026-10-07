@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>RolloverEngine — edge-aware 7-day rollover system</title>
+<meta name="description" content="Set a starting stake, a daily odds target and a number of days. The engine scans a multi-sport market, de-vigs the prices, keeps only the legs carrying real edge, and builds the highest-probability slip that lands on your target." />
+<meta name="theme-color" content="#070a0c" />
+<link rel="stylesheet" href="/app.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2308110d'/%3E%3Cpath d='M8 22l5-7 4 4 7-9' stroke='%233ddc97' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+</head>
+<body>
+<div class="bg-grid" aria-hidden="true"></div>
+<canvas id="confetti" aria-hidden="true"></canvas>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">↗</span>
+    <span class="brand-text">Rollover<b>Engine</b></span>
+    <span class="brand-tag" id="engine-version">v1.0</span>
+  </div>
+  <div class="topbar-right">
+    <span class="storage-badge" id="storage-badge" hidden></span>
+    <div class="clock" id="clock">—</div>
+    <button class="btn btn-ghost btn-sm" id="btn-settings" title="Engine settings">⚙</button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab is-active" data-tab="dashboard">Dashboard</button>
+  <button class="tab" data-tab="slip">Today's slip <span class="tab-dot" id="tab-slip-dot" hidden></span></button>
+  <button class="tab" data-tab="market">Market</button>
+  <button class="tab" data-tab="lab">The Lab</button>
+  <button class="tab" data-tab="runs">Runs</button>
+</nav>
+
+<main>
+  <!-- ══════════════════════════ DASHBOARD ══════════════════════════ -->
+  <section class="view is-active" id="view-dashboard">
+    <div id="verdict-slot"></div>
+
+    <div class="dash-grid">
+      <div class="panel panel-hero">
+        <div class="hero-top">
+          <div>
+            <div class="eyebrow">Pot <span id="hero-day-chip" class="chip chip-dim">no run</span></div>
+            <div class="money-big" id="hero-balance">₦0.00</div>
+            <div class="hero-sub" id="hero-sub">Start a rollover to begin.</div>
+          </div>
+          <div class="hero-target">
+            <div class="eyebrow">Target if it lands</div>
+            <div class="money-target" id="hero-target">₦0.00</div>
+            <div class="hero-mult" id="hero-mult">—</div>
+          </div>
+        </div>
+        <div class="hero-bar"><div class="hero-bar-fill" id="hero-bar"></div></div>
+        <div class="hero-actions">
+          <button class="btn btn-primary" id="btn-new-run">New rollover</button>
+          <button class="btn btn-ghost" id="btn-goto-slip" hidden>Open today's slip →</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Equity curve</h2><span class="panel-note" id="curve-note">—</span></div>
+        <div class="chart-wrap"><svg id="equity-chart" viewBox="0 0 620 220" preserveAspectRatio="none"></svg></div>
+        <div class="legend">
+          <span><i class="sw sw-real"></i> realised</span>
+          <span><i class="sw sw-proj"></i> projected at target odds</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>The <span id="stepper-days-label">7</span>-day run</h2><span class="panel-note" id="stepper-note">—</span></div>
+      <div class="stepper" id="stepper"></div>
+    </div>
+
+    <div class="stat-grid" id="stat-grid"></div>
+
+    <div class="panel" id="panel-projection">
+      <div class="panel-head"><h2>What you are actually signing up for</h2><span class="panel-note">closed-form arithmetic, no optimism</span></div>
+      <div class="proj-grid" id="proj-grid"></div>
+      <p class="foot-note" id="proj-note"></p>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════ SLIP ══════════════════════════ -->
+  <section class="view" id="view-slip">
+    <div id="slip-empty" class="empty-state">
+      <div class="empty-icon">◎</div>
+      <h2>No run in progress</h2>
+      <p>Start a rollover and the engine will scan the day's market across every sport it covers and hand you the slip.</p>
+      <button class="btn btn-primary" id="btn-new-run-2">New rollover</button>
+    </div>
+    <div id="slip-body" hidden></div>
+  </section>
+
+  <!-- ══════════════════════════ MARKET ══════════════════════════ -->
+  <section class="view" id="view-market">
+    <div class="panel">
+      <div class="panel-head"><h2>Market scan</h2>
+        <div class="panel-tools">
+          <input type="date" id="market-date" class="input input-sm" />
+          <button class="btn btn-sm btn-ghost" id="btn-rescan">Rescan</button>
+        </div>
+      </div>
+      <div class="scan-grid" id="scan-grid"></div>
+    </div>
+
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><h2>Value board</h2><span class="panel-note">biggest edge in the day's market</span></div>
+        <div class="table-wrap"><table class="table" id="value-board">
+          <thead><tr><th>Pick</th><th>Market</th><th>Odds</th><th>Book</th><th>Implied</th><th>Model</th><th>Edge</th><th>Conf</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Next 10 days</h2><span class="panel-note">rollover-friendliness</span></div>
+        <div class="calendar" id="calendar"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Fixtures</h2><span class="panel-note" id="fixture-note">—</span></div>
+      <div class="fixture-list" id="fixture-list"></div>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════ LAB ══════════════════════════ -->
+  <section class="view" id="view-lab">
+    <div class="panel">
+      <div class="panel-head"><h2>Monte-Carlo lab</h2><span class="panel-note">runs the whole rollover pipeline end-to-end and settles against ground truth</span></div>
+      <p class="panel-intro">
+        Every number on the dashboard is a <i>modelled</i> probability. This is where we find out whether the model is lying.
+        The lab plays your exact settings hundreds of times, settles each leg against the hidden true probability the bookmaker
+        layer never sees, then does it again with a naive picker that just grabs whatever reaches your odds target.
+        <b>If the gap is zero, the edge is zero.</b>
+      </p>
+      <div class="lab-controls" id="lab-controls">
+        <label>Runs <input type="number" id="lab-iter" value="300" min="20" max="5000" step="20" class="input" /></label>
+        <label>Days <input type="number" id="lab-days" value="7" min="2" max="14" class="input" /></label>
+        <label>Daily odds <input type="number" id="lab-odds" value="2.0" min="1.2" max="4" step="0.05" class="input" /></label>
+        <label>Market softness <input type="range" id="lab-ineff" min="0.5" max="2.5" step="0.1" value="1.3" /><span id="lab-ineff-val">1.3×</span></label>
+        <label>Build mode
+          <select id="lab-mode" class="input"><option value="balanced">balanced</option><option value="max">max probability</option><option value="combo">combo</option></select>
+        </label>
+        <button class="btn btn-primary" id="btn-run-lab">Run simulation</button>
+      </div>
+      <div class="lab-progress" id="lab-progress" hidden><div class="lab-progress-bar"></div><span>simulating…</span></div>
+      <div id="lab-results"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Why the engine wins more often than the odds suggest</h2><span class="panel-note">the maths, in full</span></div>
+      <div class="explainer" id="explainer"></div>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════ RUNS ══════════════════════════ -->
+  <section class="view" id="view-runs">
+    <div class="panel">
+      <div class="panel-head"><h2>Run history</h2><span class="panel-note">the engine reads this before recommending your next settings</span></div>
+      <div class="table-wrap"><table class="table" id="runs-table">
+        <thead><tr><th>Started</th><th>Stake</th><th>Target</th><th>Days</th><th>Progress</th><th>Balance</th><th>P/L</th><th>Status</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Lineage</h2><span class="panel-note">patterns the engine has learned from your attempts</span></div>
+      <div id="lineage"></div>
+    </div>
+  </section>
+</main>
+
+<!-- ══════════════════════════ SETUP MODAL ══════════════════════════ -->
+<div class="modal-backdrop" id="modal-setup" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Set up the rollover</h2>
+      <button class="modal-x" data-close="modal-setup">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <label class="field">
+          <span>Starting stake</span>
+          <div class="input-money"><em id="cur-symbol">₦</em><input type="number" id="f-stake" value="500" min="1" step="50" class="input" /></div>
+        </label>
+        <label class="field">
+          <span>Currency</span>
+          <select id="f-currency" class="input">
+            <option value="NGN">NGN ₦ — Naira</option><option value="GHS">GHS ₵ — Cedi</option>
+            <option value="KES">KES — Shilling</option><option value="ZAR">ZAR R — Rand</option>
+            <option value="USD">USD $</option><option value="GBP">GBP £</option><option value="EUR">EUR €</option>
+          </select>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Rollover days</span><input type="number" id="f-days" value="7" min="2" max="21" class="input" /></label>
+        <label class="field"><span>Daily odds target</span><input type="number" id="f-odds" value="2.0" min="1.2" max="5" step="0.05" class="input" /></label>
+        <label class="field"><span>Tolerance ±</span><input type="number" id="f-tol" value="0.10" min="0.01" max="0.6" step="0.01" class="input" /></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Build mode</span>
+          <select id="f-mode" class="input">
+            <option value="balanced">Balanced — accumulator, minimal probability cost</option>
+            <option value="max">Max probability — best odds of winning, leg count free</option>
+            <option value="combo">Combo — insist on the biggest slip the day supports</option>
+          </select>
+        </label>
+        <label class="field"><span>Safety reserve</span>
+          <div class="range-row"><input type="range" id="f-reserve" min="0" max="40" step="5" value="0" /><b id="f-reserve-val">0%</b></div>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Odds source</span>
+          <select id="f-provider" class="input">
+            <option value="sim">Simulated market (built-in, no key)</option>
+            <option value="manual">Manual entry — paste your book's prices</option>
+            <option value="oddsapi">The Odds API (live, needs a key)</option>
+          </select>
+        </label>
+        <label class="field"><span>Start on</span><input type="date" id="f-startday" class="input" /></label>
+      </div>
+
+      <div class="live-preview" id="setup-preview"></div>
+    </div>
+    <div class="modal-foot">
+      <p class="disclaimer">Rollover betting is a lottery-shaped bet with a small, real edge bolted on. Never stake money you cannot lose.</p>
+      <button class="btn btn-primary" id="btn-create-run">Start the rollover</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════ SETTINGS MODAL ══════════════════════════ -->
+<div class="modal-backdrop" id="modal-settings" hidden>
+  <div class="modal">
+    <div class="modal-head"><h2>Engine settings</h2><button class="modal-x" data-close="modal-settings">✕</button></div>
+    <div class="modal-body">
+      <div class="field-row">
+        <label class="field"><span>Timezone</span>
+          <select id="s-tz" class="input">
+            <option value="Africa/Lagos">Africa/Lagos (WAT)</option>
+            <option value="Africa/Accra">Africa/Accra (GMT)</option>
+            <option value="Africa/Nairobi">Africa/Nairobi (EAT)</option>
+            <option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option>
+            <option value="Europe/London">Europe/London</option>
+            <option value="UTC">UTC</option>
+            <option value="America/New_York">America/New_York</option>
+          </select>
+        </label>
+        <label class="field"><span>Events scanned per day</span><input type="number" id="s-events" value="42" min="10" max="80" class="input" /></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Market softness <em class="hint">how exploitable the books are</em></span>
+          <div class="range-row"><input type="range" id="s-ineff" min="0.5" max="2.5" step="0.1" value="1.3" /><b id="s-ineff-val">1.3×</b></div>
+        </label>
+        <label class="field"><span>Min edge per leg <em class="hint">selection floor — see note</em></span>
+          <div class="range-row"><input type="range" id="s-edge" min="0" max="3" step="0.1" value="0" /><b id="s-edge-val">0%</b></div>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Max legs per slip</span><input type="number" id="s-maxlegs" value="6" min="1" max="10" class="input" /></label>
+        <label class="field"><span>The Odds API key <em class="hint">optional</em></span><input type="password" id="s-apikey" placeholder="leave blank to use the simulator" class="input" /></label>
+      </div>
+      <p class="foot-note">
+        <b>On the edge floor.</b> Counter-intuitively, raising it usually makes a rollover
+        <i>worse</i>. Positive-edge legs are disproportionately longshots, so a hard floor starves the
+        pool of the short prices needed to build a 2.00 accumulator — the day quietly degrades into one
+        long leg. The Lab measured the engine at 53.7% a day with the floor at 0, and multi-leg coverage
+        collapsing when it was raised. The win-probability optimiser lands on +EV legs anyway (around
+        +1.5pp of edge per leg, unprompted), so leave this at 0 and read it as a reporting number rather
+        than a gate. The builder relaxes it in tiers and tells you which tier it used.
+      </p>
+      <p class="foot-note">Settings apply to every new scan and run. Existing runs keep the settings they were created with.</p>
+    </div>
+    <div class="modal-foot"><button class="btn btn-primary" id="btn-save-settings">Save settings</button></div>
+  </div>
+</div>
+
+<!-- ══════════════════════════ RESULT MODAL ══════════════════════════ -->
+<div class="modal-backdrop" id="modal-result" hidden>
+  <div class="modal modal-result" id="result-modal-inner"></div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<footer class="footer">
+  <span>RolloverEngine — de-vig, blend, edge-filter, optimise, compound.</span>
+  <span class="footer-warn">18+ · Bet with money you can afford to lose · The house always has the structural advantage; the edge here is measured, not promised.</span>
+</footer>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>
