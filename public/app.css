@@ -515,3 +515,17 @@ input[type="date"].input { color-scheme: dark; }
   background: rgba(251, 191, 36, 0.1);
   color: var(--gold);
 }
+
+/* The prices you are looking at are invented. Louder than a footnote. */
+.provider-warn {
+  margin: 10px 0 0;
+  padding: 11px 13px;
+  border: 1px solid rgba(240, 180, 60, 0.55);
+  border-left: 3px solid #f0b43c;
+  border-radius: 8px;
+  background: rgba(240, 180, 60, 0.09);
+  color: #f6dfa8;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.provider-warn b { color: #ffd97a; }

@@ -11,11 +11,11 @@ import {
   makeRng, hashSeed, blendVectors, toFractional, clamp, percentile,
 } from '../lib/math.js';
 import { modelTruth, simulateResult } from '../lib/model.js';
-import { priceEvent, extractLegs, correlationFactor } from '../lib/markets.js';
+import { priceEvent, priceEventFromOffers, extractLegs, correlationFactor, classifyBook } from '../lib/markets.js';
 import { applyMarketInformation, INFO_SHARE } from '../lib/truth.js';
 import { buildRolloverSlip } from '../lib/builder.js';
 import { buildDayEvents, dayShape, eventsForDay, tzDateKey, zonedTimeToMs } from '../lib/fixtures.js';
-import { scanDay } from '../lib/scan.js';
+import { scanDay, scanDayLive } from '../lib/scan.js';
 import { settleLegs } from '../lib/settle.js';
 import {
   createRun, scanRunDay, confirmDay, settleDay, restartRun, skipDay,
@@ -1221,5 +1221,272 @@ describe('projection arithmetic', () => {
     assert.match(p.dailySource, /measured/i);
     assert.ok(p.evPct > 0, 'above breakeven must be +EV');
     assert.ok(p.oneIn < 128, 'better than fair odds means better than 1-in-128');
+  });
+});
+
+/* ================================================================== *
+ * LIVE ODDS — the path that prices real bookmaker quotes
+ * ================================================================== */
+
+/**
+ * A realistic The Odds API v4 payload. Three books on the football game
+ * including one sharp (Pinnacle), two on the basketball game, and a market the
+ * live scanner deliberately ignores (totals) so we can prove it is not silently
+ * half-pricing things it cannot model.
+ */
+const LIVE_FIXTURES = {
+  soccer_epl: [{
+    id: 'epl-1', sport_key: 'soccer_epl',
+    commence_time: new Date(Date.now() + 20 * 3600e3).toISOString(),
+    home_team: 'Arsenal', away_team: 'Everton',
+    bookmakers: [
+      { key: 'pinnacle', title: 'Pinnacle', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.42 }, { name: 'Everton', price: 8.1 }, { name: 'Draw', price: 5.05 }] },
+        { key: 'totals', outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 1.95 }] },
+      ] },
+      { key: 'bet365', title: 'Bet365', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.4 }, { name: 'Everton', price: 8.0 }, { name: 'Draw', price: 4.8 }] },
+      ] },
+      { key: 'bet9ja', title: 'Bet9ja', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.38 }, { name: 'Everton', price: 7.5 }, { name: 'Draw', price: 4.6 }] },
+      ] },
+    ],
+  }],
+  basketball_nba: [{
+    id: 'nba-1', sport_key: 'basketball_nba',
+    commence_time: new Date(Date.now() + 22 * 3600e3).toISOString(),
+    home_team: 'Lakers', away_team: 'Celtics',
+    bookmakers: [
+      { key: 'pinnacle', title: 'Pinnacle', markets: [{ key: 'h2h', outcomes: [{ name: 'Lakers', price: 2.05 }, { name: 'Celtics', price: 1.86 }] }] },
+      { key: 'unibet', title: 'Unibet', markets: [{ key: 'h2h', outcomes: [{ name: 'Lakers', price: 2.0 }, { name: 'Celtics', price: 1.83 }] }] },
+    ],
+  }],
+};
+
+/** Swap globalThis.fetch for the duration of one test. */
+async function withFetch(handler, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = handler;
+  try { return await fn(); } finally { globalThis.fetch = real; }
+}
+
+const okFetch = async (url) => {
+  const key = /sports\/([a-z_]+)\/odds/.exec(url)?.[1];
+  return { ok: true, json: async () => LIVE_FIXTURES[key] || [] };
+};
+
+describe('live odds — real quotes, and never a silent simulation', () => {
+  const dayKey = new Date(Date.now() + 20 * 3600e3).toISOString().slice(0, 10);
+  const liveOpts = { apiKey: 'test-key', tz: 'UTC', daysAhead: 3, builder: { targetOdds: 2.0, tolerance: 0.35, mode: 'balanced' } };
+
+  test('classifies books into the same three tiers the simulator uses', () => {
+    assert.equal(classifyBook('Pinnacle'), 'sharp');
+    assert.equal(classifyBook('SBOBET'), 'sharp');
+    assert.equal(classifyBook('Bet365'), 'mid');
+    // Unknown books are soft — assuming sharpness is the error that flatters us.
+    assert.equal(classifyBook('SomeBackyardBook'), 'soft');
+    assert.equal(classifyBook(''), 'soft');
+  });
+
+  test('prices a real fixture through the same blend the Lab justified', async () => {
+    const res = await withFetch(okFetch, () => scanDayLive(dayKey, liveOpts));
+    assert.equal(res.scan.events.length, 2, 'both fixtures are on that day');
+    assert.equal(res.diagnostics.providerUsed, 'oddsapi');
+    assert.equal(res.diagnostics.fellBack, false);
+    assert.ok(res.diagnostics.books.includes('Pinnacle'), 'the sharp book is in the pool');
+    assert.equal(res.diagnostics.bookCount, res.diagnostics.books.length);
+
+    const arsenal = res.scan.legs.find((l) => l.pick === 'Arsenal');
+    assert.ok(arsenal, 'Arsenal is priced');
+    // Line shopping must take the BEST price, not the first or the average.
+    assert.equal(arsenal.odds, 1.42, 'best of 1.42 / 1.40 / 1.38');
+    assert.equal(arsenal.book, 'Pinnacle');
+    // De-vigged consensus across three books whose raw implied sums to >1.
+    assert.ok(arsenal.fairProb > 0.6 && arsenal.fairProb < 0.75, `fairProb ${arsenal.fairProb}`);
+    // The sharp book quotes Arsenal shortest-relative, so sharpProb >= consensus.
+    assert.ok(arsenal.sharpProb >= arsenal.fairProb - 0.02, `sharp ${arsenal.sharpProb} vs consensus ${arsenal.fairProb}`);
+    assert.ok(arsenal.confidence > 0 && arsenal.confidence <= 1);
+    assert.equal(arsenal.live, true);
+  });
+
+  test('leaves truth null on a live leg — no tautological calibration', async () => {
+    const res = await withFetch(okFetch, () => scanDayLive(dayKey, liveOpts));
+    assert.equal(res.diagnostics.truthKnown, false);
+    for (const l of res.scan.legs) {
+      assert.equal(l.truthProb, null, 'a live fixture has no ground truth yet');
+      assert.equal(l.trueEvPerUnit, null);
+      assert.equal(l.modelError, null);
+      assert.equal(l.ratingsError, null);
+    }
+  });
+
+  test('prices only head-to-head, and says so rather than half-pricing the rest', async () => {
+    const res = await withFetch(okFetch, () => scanDayLive(dayKey, liveOpts));
+    assert.match(res.diagnostics.scope, /head-to-head/i);
+    assert.ok(res.scan.legs.every((l) => l.marketType === 'h2h'), 'the totals market was not invented a model for');
+    // 3 outcomes on the football game + 2 on the basketball game.
+    assert.equal(res.scan.legs.length, 5);
+  });
+
+  test('builds a real slip from live prices', async () => {
+    const res = await withFetch(okFetch, () => scanDayLive(dayKey, liveOpts));
+    assert.ok(res.builder.ok, res.builder.message);
+    assert.ok(res.builder.best.odds > 0);
+    assert.ok(res.builder.best.winProbPct > 0 && res.builder.best.winProbPct < 100);
+  });
+
+  test('throws when there is no key instead of quietly simulating', async () => {
+    await assert.rejects(
+      () => scanDayLive(dayKey, { tz: 'UTC' }),
+      (e) => { assert.equal(e.code, 'NO_KEY'); return true; },
+      'a missing key must be an error, not an invented price list',
+    );
+  });
+
+  test('throws when the API returns nothing — a dead key must not look like a quiet day', async () => {
+    await withFetch(async () => ({ ok: true, json: async () => [] }), async () => {
+      await assert.rejects(
+        () => scanDayLive(dayKey, liveOpts),
+        (e) => { assert.equal(e.code, 'NO_GAMES'); return true; },
+      );
+    });
+  });
+
+  test('the synchronous scan admits when it fell back, and why', () => {
+    const noKey = scanDay(dayKey, { tz: 'UTC', provider: 'oddsapi' });
+    assert.equal(noKey.diagnostics.providerRequested, 'oddsapi');
+    assert.equal(noKey.diagnostics.providerUsed, 'sim');
+    assert.equal(noKey.diagnostics.fellBack, true);
+    assert.match(noKey.diagnostics.fallbackReason, /no API key/i);
+
+    const withKey = scanDay(dayKey, { tz: 'UTC', provider: 'oddsapi', apiKey: 'k' });
+    assert.equal(withKey.diagnostics.fellBack, true);
+    assert.match(withKey.diagnostics.fallbackReason, /async live scan/i, 'it points at the route that can actually fetch');
+
+    const manual = scanDay(dayKey, { tz: 'UTC', provider: 'manual' });
+    assert.equal(manual.diagnostics.fellBack, true);
+    assert.match(manual.diagnostics.fallbackReason, /none were supplied/i);
+
+    const plain = scanDay(dayKey, { tz: 'UTC' });
+    assert.equal(plain.diagnostics.fellBack, false, 'asking for the simulator and getting it is not a fallback');
+    assert.equal(plain.diagnostics.fallbackReason, null);
+  });
+
+  test('one cached day cannot leak another request\'s provider story', () => {
+    /* scanSim memoises on (dayKey, tz, events, inefficiency) — NOT on provider —
+     * so it hands back a shared object. Stamping that object in place made the
+     * fourth request inherit the third one's answer. Copy, never mutate. */
+    const a = scanDay(dayKey, { tz: 'UTC', provider: 'oddsapi' });
+    const b = scanDay(dayKey, { tz: 'UTC' });
+    assert.equal(a.diagnostics.fellBack, true, 'the oddsapi request still reports its own fallback');
+    assert.equal(b.diagnostics.fellBack, false, 'and the sim request was not contaminated by it');
+    assert.equal(a.diagnostics.providerRequested, 'oddsapi');
+    assert.equal(b.diagnostics.providerRequested, 'sim');
+  });
+
+  test('priceEventFromOffers returns the same row shape priceEvent does', () => {
+    /* The live and simulated paths must stay interchangeable downstream, or the
+     * builder and the UI grow a second set of special cases. */
+    const event = {
+      id: 'x', sport: 'football', league: { name: 'Test', code: 'TST', tier: 1 },
+      kickoff: Date.now() + 86400e3, home: { name: 'A' }, away: { name: 'B' },
+      markets: [{ key: 'h2h', name: 'Match Result', type: 'h2h', outcomes: [
+        { key: 'a', label: 'A', p: 0.4 }, { key: 'b', label: 'B', p: 0.3 }, { key: 'draw', label: 'Draw', p: 0.3 },
+      ] }],
+    };
+    const offers = new Map([['h2h', [
+      { book: { name: 'Pinnacle', cls: 'sharp' }, odds: [2.1, 3.6, 3.4] },
+      { book: { name: 'Bet365', cls: 'mid' }, odds: [2.0, 3.5, 3.3] },
+    ]]]);
+    const live = priceEventFromOffers(event, offers, { tier: 1, kickoffHours: 20 });
+    assert.equal(live.truthKnown, false);
+    assert.equal(live.markets.length, 1);
+    const row = live.markets[0].outcomes[0];
+    for (const f of ['key', 'label', 'odds', 'bestBook', 'avgOdds', 'impliedProb', 'fairProb', 'sharpProb',
+                     'ratingsProb', 'modelProb', 'edge', 'edgePct', 'evPerUnit', 'kelly', 'confidence',
+                     'confidenceBand', 'agreement']) {
+      assert.ok(f in row, `live row is missing "${f}" that the simulated path emits`);
+    }
+    assert.equal(row.odds, 2.1, 'best price wins');
+    assert.equal(row.bestBook, 'Pinnacle');
+    assert.equal(row.truthProb, null);
+  });
+
+  test('skips a book that failed to quote every outcome rather than de-vigging a partial market', () => {
+    /* De-vigging 2 of 3 outcomes silently inflates the third. Dropping the
+     * incomplete book is the conservative move. */
+    const event = {
+      id: 'y', sport: 'football', league: { name: 'Test', code: 'TST', tier: 1 },
+      kickoff: Date.now(), home: { name: 'A' }, away: { name: 'B' },
+      markets: [{ key: 'h2h', name: 'Match Result', type: 'h2h', outcomes: [
+        { key: 'a', label: 'A', p: 0.4 }, { key: 'b', label: 'B', p: 0.3 }, { key: 'draw', label: 'Draw', p: 0.3 },
+      ] }],
+    };
+    const offers = new Map([['h2h', [
+      { book: { name: 'Pinnacle', cls: 'sharp' }, odds: [2.1, 3.6, 3.4] },
+      { book: { name: 'Partial', cls: 'soft' }, odds: [2.0, 3.5, NaN] },
+    ]]]);
+    const priced = priceEventFromOffers(event, offers, { tier: 1 });
+    assert.equal(priced.markets[0].books.length, 1, 'the incomplete book was dropped');
+    assert.equal(priced.markets[0].books[0].book, 'Pinnacle');
+  });
+});
+
+describe('API surface — provider honesty and malformed input', () => {
+  const mkApi = async (env = {}) => {
+    const { createApi } = await import('../lib/http-core.js');
+    const { createMemoryStore } = await import('../lib/memory-store.js');
+    return createApi({ store: createMemoryStore(), env, persistent: false });
+  };
+  const qs = (s) => new URLSearchParams(s);
+
+  test('GET /api/scan reports which provider answered', async () => {
+    const api = await mkApi();
+    const r = await api({ method: 'GET', pathname: '/api/scan', query: qs(`date=${DAY}&odds=2.0&provider=oddsapi`) });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.provider.requested, 'oddsapi');
+    assert.equal(r.body.provider.used, 'sim');
+    assert.equal(r.body.provider.fellBack, true);
+    assert.ok(r.body.provider.reason, 'and it explains itself');
+  });
+
+  test('/api/scan/live exists — the route the sync scan has always advertised', async () => {
+    const api = await mkApi();
+    const r = await api({ method: 'POST', pathname: '/api/scan/live', body: { date: DAY } });
+    assert.equal(r.status, 400, 'no key is a client error, not a 404 for a missing route');
+    assert.match(r.body.error, /No API key/);
+    assert.ok(r.body.hint);
+  });
+
+  test('/api/scan/live really prices live quotes when a key is present', async () => {
+    const api = await mkApi();
+    await withFetch(okFetch, async () => {
+      const date = new Date(Date.now() + 20 * 3600e3).toISOString().slice(0, 10);
+      const r = await api({ method: 'POST', pathname: '/api/scan/live', body: { date, apiKey: 'k', odds: 2.0, tolerance: 0.35 } });
+      assert.equal(r.status, 200, JSON.stringify(r.body).slice(0, 200));
+      assert.equal(r.body.provider.used, 'oddsapi');
+      assert.equal(r.body.provider.fellBack, false);
+      assert.equal(r.body.truthKnown, false);
+      assert.ok(r.body.diagnostics.books.length >= 2);
+    });
+  });
+
+  test('toPlain survives Sets and Maps; jsonSafe is a reviver, not a sanitizer', async () => {
+    /* jsonSafe(key, value) is a JSON.stringify REVIVER. Calling it as
+     * jsonSafe(obj) passes the object as the key and undefined as the value, so
+     * it returns undefined — which silently emptied a whole route's body. */
+    const { jsonSafe, toPlain } = await import('../lib/http-core.js');
+    assert.equal(jsonSafe({ a: 1 }), undefined, 'the trap: one argument means "no value"');
+    const withSet = { books: new Set(['a', 'b']), byKey: new Map([['k', 1]]) };
+    assert.deepEqual(toPlain(withSet), { books: ['a', 'b'], byKey: { k: 1 } });
+    assert.equal(JSON.stringify(withSet, jsonSafe).includes('"a"'), true);
+  });
+
+  test('a malformed query is an empty query, not a crashed handler', async () => {
+    const api = await mkApi();
+    for (const bad of ['date=2026-10-08', undefined, null, '']) {
+      const r = await api({ method: 'GET', pathname: '/api/scan', query: bad });
+      assert.equal(r.status, 200, `query=${JSON.stringify(bad)}`);
+    }
   });
 });

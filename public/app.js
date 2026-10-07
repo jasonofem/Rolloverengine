@@ -315,6 +315,21 @@ function renderStepper() {
     .join('');
 }
 
+/**
+ * One honest word for where the prices in front of you came from.
+ *
+ * `sim` reads as a technicality; "SIMULATED PRICES" reads as a warning. When the
+ * user asked for live odds and did not get them, the badge has to say so in the
+ * same breath as the telemetry, not in a tooltip they will never open.
+ */
+function providerLabel(sc) {
+  const used = sc?.providerUsed || sc?.provider || 'sim';
+  if (used === 'oddsapi') return '⚡ LIVE odds';
+  if (used === 'manual') return '✍ your pasted odds';
+  if (sc?.providerFellBack) return '⚠ SIMULATED prices (live was requested)';
+  return '◈ SIMULATED prices';
+}
+
 function renderStats() {
   const host = $('#stat-grid');
   const r = S.run;
@@ -800,7 +815,11 @@ function scanStatsHTML(day) {
   ];
   return `<div class="panel">
     <div class="panel-head"><h2>Scan telemetry — ${esc(day.date)}</h2>
-      <span class="panel-note">${esc(sc.provider)} · ${esc(sc.scannedAt?.slice(0, 16).replace('T', ' ') || '')} · band ${sc.report?.lo ?? '—'}–${sc.report?.hi ?? '—'}</span></div>
+      <span class="panel-note">${providerLabel(sc)} · ${esc(sc.scannedAt?.slice(0, 16).replace('T', ' ') || '')} · band ${sc.report?.lo ?? '—'}–${sc.report?.hi ?? '—'}</span></div>
+    ${sc.providerFellBack ? `<div class="provider-warn">
+        <b>These prices are simulated.</b> You asked for <b>${esc(sc.providerRequested || 'live odds')}</b> and got the built-in
+        simulator instead. ${esc(sc.providerFallbackReason || '')} Nothing below is a real price, so do not stake against it.
+      </div>` : ''}
     <div class="scan-grid">${cells.map(([v, l]) => `<div class="scan-cell"><div class="v">${v ?? '—'}</div><div class="l">${l}</div></div>`).join('')}</div>
     ${sc.bestEdgeLegs?.length ? `<div class="section-title">Rejected & accepted — the day's fattest edges</div>
       <div class="table-wrap"><table class="table"><thead><tr><th>Fixture</th><th>Pick</th><th>Odds</th><th>Implied</th><th>Model</th><th>Edge</th><th>Conf</th></tr></thead><tbody>

@@ -288,8 +288,52 @@ live prices:
 
 - **Paste your own odds.** Provider `manual` de-vigs whatever you give it — you
   are the book aggregation layer.
-- **The Odds API.** Set `ODDS_API_KEY` or paste a key in settings. The free tier
-  is enough.
+- **The Odds API.** Set `ODDS_API_KEY` or paste one in settings; the free tier is
+  enough. `POST /api/scan/live` fetches nine leagues, classifies each book as
+  sharp/mid/soft, line-shops the best price per outcome, de-vigs every book and
+  runs the *same* blend the Lab justified — the maths is shared with the
+  simulated path, only the offer construction differs.
+
+  **Scope, stated plainly: head-to-head only.** The API also returns totals and
+  spreads, but pricing those for a club the ratings table has never seen means
+  inventing a scoring model, and an invented model is exactly what `lib/truth.js`
+  exists to stop us trusting. One market priced honestly beats four priced
+  confidently from nothing. Live legs carry `live: true` and `truthProb: null`,
+  because with a real fixture nobody knows the answer yet — so the Lab and the
+  calibration panel cannot read a live leg as though it had been settled against
+  ground truth. A calibration number computed against your own prediction is a
+  tautology.
+
+  **It has never been run against the real API.** This sandbox has no route to
+  `api.the-odds-api.com`. The live path is tested against a stubbed payload that
+  matches the v4 schema, which proves the parsing, the blend and the slip build —
+  it does not prove the real response shape hasn't moved. Treat the first live
+  scan as a first run, not a verified feature.
+
+### Nothing is ever silently simulated
+
+This is the failure mode the engine is built to refuse. If you ask for live odds
+or pasted odds and the engine cannot give them to you, it says so in the payload
+and in the UI:
+
+```json
+{ "provider": {
+    "requested": "oddsapi",
+    "used": "sim",
+    "fellBack": true,
+    "reason": "You asked for live odds but no API key was available, so these prices are simulated." } }
+```
+
+The dashboard prints a warning banner across the telemetry panel — *"These prices
+are simulated. Nothing below is a real price, so do not stake against it."* — and
+the persisted day records `providerRequested`, `providerFellBack` and the reason,
+so a run priced off invented numbers stays distinguishable from one priced off
+real ones weeks later, when you can no longer remember which was which.
+
+`/api/scan/live` goes further and **throws** rather than falling back: a missing
+key is a 400, an empty response is a 502. "I could not get you live prices" and
+"here are live prices" are not interchangeable sentences, and only one of them is
+safe to guess.
 
 ---
 

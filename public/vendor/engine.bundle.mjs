@@ -1922,12 +1922,14 @@ __exp_26 = applyMarketInformation;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   lib/markets.js   →  hoists correlationFactor, priceEvent, extractLegs, SIGNAL_WEIGHTS
+   lib/markets.js   →  hoists correlationFactor, priceEvent, priceEventFromOffers, extractLegs, classifyBook, SIGNAL_WEIGHTS
    ════════════════════════════════════════════════════════════════════════ */
 let __exp_27;
 let __exp_28;
 let __exp_29;
 let __exp_30;
+let __exp_31;
+let __exp_32;
 {
 const devig = __exp_9;
 const makeRng = __exp_8;
@@ -2330,17 +2332,171 @@ function correlationFactor(legs) {
  */
 const CORR_PER_EXTRA_LEG = 0.012;
 const CORR_CAP = 0.06;
+
+/* ------------------------------------------------------------------ *
+ * LIVE pricing — real quotes from a bookmaker API
+ * ------------------------------------------------------------------ */
+
+/**
+ * Classify a book by name, using the same three tiers the simulator uses.
+ *
+ * The tier is what decides how much weight a quote carries: sharp books are
+ * de-vigged to a 0.19pp error against ground truth, so they get 0.62 of the
+ * blend, and a misclassified Pinnacle would quietly poison the whole estimate.
+ * Unknown books are treated as soft — the conservative default, since assuming
+ * sharpness is the error that flatters us.
+ */
+function classifyBook(name) {
+  const n = String(name || '').toLowerCase();
+  if (/pinnacle|sbobet|circa|cris|betfair|matchbook|smarkets/.test(n)) return 'sharp';
+  if (/bet365|unibet|william|betway|888|marathon/.test(n)) return 'mid';
+  return 'soft';
+}
+
+/**
+ * Price an event from REAL quotes rather than simulated ones.
+ *
+ * Shares `devig`, `SIGNAL_WEIGHTS`, `confidence`, `confBand` and
+ * `crossBookAgreement` with `priceEvent`, so the blend that the Lab justified is
+ * the blend the live path runs — the maths is not duplicated, only the offer
+ * construction is, because that is the part that genuinely differs: here the
+ * quotes are facts instead of draws from a seeded RNG.
+ *
+ * There is no ground truth and no honest way to invent one. `truthKnown` is
+ * false and truthProb / trueEvPerUnit / modelError / ratingsError come back
+ * null rather than being filled from the model — a calibration number computed
+ * against your own prediction is a tautology, and reporting one would let the
+ * live deployment "confirm" the very weights it is supposed to be testing.
+ *
+ * @param {object} event          { id, home, away, league, kickoff, markets: [{ key, name, type, outcomes }] }
+ * @param {Map}    offersByMarket  market key -> [{ book: { name, cls }, odds: [...] }] aligned to outcomes
+ * @param {object} opts            { tier, kickoffHours }
+ */
+function priceEventFromOffers(event, offersByMarket, opts = {}) {
+  const tier = opts.tier ?? event.league?.tier ?? 2;
+  const kickoffHours = opts.kickoffHours ?? 20;
+  const priced = [];
+  const bookNames = new Set();
+
+  for (const m of event.markets || []) {
+    const raw = offersByMarket.get(m.key);
+    const n = m.outcomes?.length || 0;
+    if (!raw?.length || !n) continue;
+
+    /* A book that did not quote every outcome has to go. De-vigging two of three
+     * prices divides by an over-round that excludes the missing outcome, which
+     * silently inflates the ones we did get — and one NaN anywhere in the vector
+     * then poisons every average built from it. Dropping the incomplete book is
+     * the conservative move; there is no honest way to guess the price. */
+    const offers = raw.filter((off) =>
+      Array.isArray(off.odds) && off.odds.length === n && off.odds.every((o) => Number.isFinite(o) && o > 1));
+    if (!offers.length) continue;
+    for (const off of offers) bookNames.add(off.book.name);
+
+    // ---- line shopping: best available price per outcome --------------
+    const bestOdds = new Array(n).fill(0);
+    const bestBook = new Array(n).fill(null);
+    for (const off of offers) {
+      for (let i = 0; i < n; i++) {
+        const o = off.odds[i];
+        if (Number.isFinite(o) && o > bestOdds[i]) { bestOdds[i] = o; bestBook[i] = off.book.name; }
+      }
+    }
+    if (bestOdds.some((o) => !(o > 1))) continue; // an outcome nobody priced
+
+    // ---- de-vig every book, then across the sharp subset --------------
+    const perBookFair = offers.map((off) => devig(off.odds).fair);
+    const consensus = new Array(n).fill(0);
+    for (const f of perBookFair) for (let i = 0; i < n; i++) consensus[i] += f[i];
+    for (let i = 0; i < n; i++) consensus[i] /= perBookFair.length;
+
+    const sharpIdx = offers.map((off, i) => i).filter((i) => offers[i].book.cls === 'sharp');
+    const sharp = new Array(n).fill(0);
+    if (sharpIdx.length) {
+      for (const i of sharpIdx) for (let k = 0; k < n; k++) sharp[k] += perBookFair[i][k];
+      for (let k = 0; k < n; k++) sharp[k] /= sharpIdx.length;
+    } else {
+      // No sharp book quoted this market. Fall back to consensus rather than
+      // letting a null propagate into the blend.
+      for (let k = 0; k < n; k++) sharp[k] = consensus[k];
+    }
+
+    // ---- the same blend, with the ratings prior as the only local view --
+    const w = SIGNAL_WEIGHTS;
+    const ratingsP = m.outcomes.map((o) => o.p);
+    const model = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) model[i] = w.consensus * consensus[i] + w.sharp * sharp[i] + w.ratings * ratingsP[i];
+    const mSum = model.reduce((a, c) => a + c, 0) || 1;
+    for (let i = 0; i < n; i++) model[i] /= mSum;
+
+    const implied = bestOdds.map((o) => 1 / o);
+    const outcomeRows = m.outcomes.map((o, i) => {
+      const agreement = crossBookAgreement(perBookFair, i);
+      const conf = confidence({
+        tier,
+        bookCount: offers.length,
+        agreement,
+        kickoffHours,
+        liquidity: tier === 1 ? 1 : tier === 2 ? 0.78 : 0.55,
+      });
+      return {
+        key: o.key,
+        label: o.label,
+        odds: bestOdds[i],
+        bestBook: bestBook[i],
+        avgOdds: round(mean(offers.map((off) => off.odds[i])), 3),
+        impliedProb: round(implied[i], 4),
+        fairProb: round(consensus[i], 4),
+        sharpProb: round(sharp[i], 4),
+        ratingsProb: round(ratingsP[i], 4),
+        modelProb: round(model[i], 4),
+        truthProb: null,
+        edge: round(model[i] - implied[i], 4),
+        edgePct: round((model[i] - implied[i]) * 100, 2),
+        evPerUnit: round(ev(model[i], bestOdds[i]), 4),
+        trueEvPerUnit: null,
+        kelly: round(Math.max(0, ((bestOdds[i] - 1) * model[i] - (1 - model[i])) / (bestOdds[i] - 1)), 4),
+        confidence: round(conf, 3),
+        confidenceBand: confBand(conf),
+        agreement: round(agreement, 4),
+        modelError: null,
+        ratingsError: null,
+      };
+    });
+
+    priced.push({
+      key: m.key,
+      name: m.name,
+      type: m.type,
+      line: m.line ?? null,
+      team: m.team ?? null,
+      exclusive: m.type !== 'double_chance',
+      overround: round(mean(offers.map((off) => devig(off.odds).overround)) * 100, 2),
+      outcomes: outcomeRows,
+      books: offers.map((off) => ({
+        book: off.book.name,
+        cls: off.book.cls,
+        odds: off.odds,
+        margin: round(devig(off.odds).overround * 100, 2),
+      })),
+    });
+  }
+
+  return { markets: priced, books: [...bookNames].sort(), truthKnown: false };
+}
 __exp_27 = correlationFactor;
 __exp_28 = priceEvent;
-__exp_29 = extractLegs;
-__exp_30 = SIGNAL_WEIGHTS;
+__exp_29 = priceEventFromOffers;
+__exp_30 = extractLegs;
+__exp_31 = classifyBook;
+__exp_32 = SIGNAL_WEIGHTS;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/builder.js   →  hoists buildRolloverSlip, DEFAULT_BUILDER_OPTS
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_31;
-let __exp_32;
+let __exp_33;
+let __exp_34;
 {
 const clamp = __exp_6;
 const round = __exp_7;
@@ -2823,27 +2979,30 @@ function suggestSwap(combo, legIndex, allLegs, opts = {}) {
     newWinProb: c.winProb,
   }));
 }
-__exp_31 = buildRolloverSlip;
-__exp_32 = DEFAULT_BUILDER_OPTS;
+__exp_33 = buildRolloverSlip;
+__exp_34 = DEFAULT_BUILDER_OPTS;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   lib/scan.js   →  hoists scanForDay, scanDay, PROVIDERS, fetchOddsApi
+   lib/scan.js   →  hoists scanForDay, scanDay, scanDayLive, PROVIDERS, fetchOddsApi
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_33;
-let __exp_34;
 let __exp_35;
 let __exp_36;
+let __exp_37;
+let __exp_38;
+let __exp_39;
 {
 const buildDayEvents = __exp_18;
 const tzDateKey = __exp_19;
 const tzNowParts = __exp_20;
 const formatKickoff = __exp_21;
 const priceEvent = __exp_28;
-const extractLegs = __exp_29;
+const priceEventFromOffers = __exp_29;
+const extractLegs = __exp_30;
+const classifyBook = __exp_31;
 const applyMarketInformation = __exp_26;
-const buildRolloverSlip = __exp_31;
-const DEFAULT_BUILDER_OPTS = __exp_32;
+const buildRolloverSlip = __exp_33;
+const DEFAULT_BUILDER_OPTS = __exp_34;
 const makeRng = __exp_8;
 const clamp = __exp_6;
 const round = __exp_7;
@@ -2901,15 +3060,86 @@ const DAY_CACHE_LIMIT = 24;
  * @param {object} opts    { tz, provider, eventsPerDay, manualOdds, apiKey, marketInefficiency, builder }
  */
 function scanDay(dayKey, opts = {}) {
-  const provider = opts.provider || 'sim';
-  if (provider === 'manual' && opts.manualOdds?.length) {
-    return scanManual(dayKey, opts);
+  const requested = opts.provider || 'sim';
+  if (requested === 'manual') {
+    if (opts.manualOdds?.length) return stamp(scanManual(dayKey, opts), requested, 'manual', null);
+    /* You cannot silently answer a request for real prices with invented ones.
+     * The user chose "paste your bookmaker's odds"; if nothing was pasted the
+     * honest answer is a simulator run that says so out loud. */
+    return stamp(scanSim(dayKey, opts), requested, 'sim',
+      'You asked for manually entered odds but none were supplied, so these prices are simulated.');
   }
-  if (provider === 'oddsapi' && opts.apiKey) {
-    // Live fetch is async; the caller (server) uses scanDayLive for that path.
-    return scanDaySyncFallback(dayKey, opts, 'oddsapi requires an async scan — use /api/scan/async');
+  if (requested === 'oddsapi') {
+    if (!opts.apiKey) {
+      return stamp(scanSim(dayKey, opts), requested, 'sim',
+        'You asked for live odds but no API key was available, so these prices are simulated. Set ODDS_API_KEY or paste a key in settings.');
+    }
+    /* Live fetching is async and this function is not. Rather than pretend, the
+     * sync path says so and points at the async one. */
+    return stamp(scanSim(dayKey, opts), requested, 'sim',
+      'A synchronous scan cannot fetch live odds — use the async live scan (/api/scan/live). These prices are simulated.');
   }
-  return scanSim(dayKey, opts);
+  return stamp(scanSim(dayKey, opts), requested, 'sim', null);
+}
+
+/**
+ * Record which provider was asked for and which one actually answered.
+ *
+ * `provider` stays the truth about the data in front of you; `providerRequested`
+ * plus `fallbackReason` are what stop that truth from being buried. Every scan
+ * that reaches the UI carries these, so a run priced off invented numbers cannot
+ * look like a run priced off real ones.
+ *
+ * IMPORTANT: `scanSim` memoises on (dayKey, tz, eventsPerDay, inefficiency) — not
+ * on provider. So the object handed back is SHARED between callers, and writing
+ * to it would leak one request's provider story into the next request's response.
+ * Copy the diagnostics instead of mutating them.
+ */
+function stamp(scan, requested, used, fallbackReason) {
+  return {
+    ...scan,
+    diagnostics: {
+      ...(scan.diagnostics || {}),
+      providerRequested: requested,
+      providerUsed: used,
+      provider: used,
+      fallbackReason,
+      fellBack: Boolean(fallbackReason) && requested !== used,
+    },
+  };
+}
+
+/**
+ * Async live scan: really fetch The Odds API, really build a slip from it.
+ *
+ * This is the path the sync scan can never take. If the key is missing, the
+ * network is blocked or every league 404s, it does not quietly hand back the
+ * simulator — it throws, because "I could not get you live prices" and "here are
+ * live prices" are not the same sentence and only one of them is safe to guess.
+ */
+async function scanDayLive(dayKey, opts = {}) {
+  const apiKey = opts.apiKey;
+  if (!apiKey) {
+    const e = new Error('No API key. Set ODDS_API_KEY in the environment or paste one in settings.');
+    e.code = 'NO_KEY';
+    throw e;
+  }
+  const games = await fetchOddsApi(opts.sports, apiKey, { daysAhead: opts.daysAhead ?? 2 });
+  if (!games.length) {
+    const e = new Error('The Odds API returned no games. Check the key, the remaining quota, and that these leagues have fixtures in the window.');
+    e.code = 'NO_GAMES';
+    throw e;
+  }
+  const scan = stamp(scanLiveGames(dayKey, games, opts), 'oddsapi', 'oddsapi', null);
+  const builderOpts = { ...DEFAULT_BUILDER_OPTS, ...(opts.builder || {}) };
+  return {
+    scan,
+    builder: buildRolloverSlip(scan.legs, builderOpts),
+    builderOpts,
+    legs: scan.legs,
+    events: scan.events,
+    diagnostics: scan.diagnostics,
+  };
 }
 
 function scanSim(dayKey, opts = {}) {
@@ -2992,11 +3222,132 @@ function scanSim(dayKey, opts = {}) {
   return result;
 }
 
-function scanDaySyncFallback(dayKey, opts, note) {
-  const r = scanSim(dayKey, opts);
-  r.diagnostics.provider = 'sim';
-  r.diagnostics.note = note;
-  return r;
+/**
+ * Turn games fetched from The Odds API into the same scan bundle the simulator
+ * produces, so everything downstream — builder, settlement, UI — is unchanged.
+ *
+ * SCOPE, stated plainly: this prices the head-to-head market. The Odds API also
+ * returns totals and spreads, but turning those into a market tree for a team we
+ * have no rating for means inventing a scoring model, and an invented model is
+ * exactly what lib/truth.js exists to stop us from trusting. One market priced
+ * honestly beats four priced confidently from nothing.
+ *
+ * Every leg this produces carries `live: true` and `truthProb: null`, so the Lab
+ * and the calibration panel cannot read a live leg as though it had been settled
+ * against ground truth.
+ */
+function scanLiveGames(dayKey, games, opts = {}) {
+  const tz = opts.tz || 'UTC';
+  const legs = [];
+  const events = [];
+  const bookNames = new Set();
+  let pricesQuoted = 0;
+  let marketsSeen = 0;
+  let skippedNoFixture = 0;
+
+  for (const g of games) {
+    if (!g.kickoff || !Number.isFinite(g.kickoff)) continue;
+    if (tzDateKey(new Date(g.kickoff), tz) !== dayKey) { skippedNoFixture += 1; continue; }
+
+    const h2h = (g.books || [])
+      .flatMap((b) => (b.markets || []).filter((m) => m.key === 'h2h').map((m) => ({ book: b, m })));
+    if (!h2h.length) continue;
+    marketsSeen += h2h.length;
+
+    // Align every book onto one outcome order so devig can compare like with like.
+    const names = [];
+    for (const { m } of h2h) for (const o of m.outcomes || []) if (!names.includes(o.name)) names.push(o.name);
+    if (names.length < 2) continue;
+
+    const offers = [];
+    const outcomes = [];
+    for (const { book, m } of h2h) {
+      const byName = new Map((m.outcomes || []).map((o) => [o.name, o.price]));
+      const odds = names.map((nm) => byName.get(nm));
+      if (odds.some((o) => !(Number.isFinite(o) && o > 1))) continue; // every book must quote every outcome
+      offers.push({ book: { name: book.name, cls: book.cls }, odds });
+      pricesQuoted += odds.length;
+      bookNames.add(book.name);
+    }
+    if (!offers.length) continue;
+
+    /* Ratings prior. Real club names will not be in the seed table unless they
+     * happen to match, and that is fine: the blend gives ratings 8%, so a tier
+     * prior moves the estimate by less than a point. It is labelled as what it
+     * is rather than passed off as a considered opinion of these two teams. */
+    const prior = outcomePrior(names, g.home?.name);
+    const event = {
+      id: g.id,
+      sport: g.sport,
+      league: g.league,
+      kickoff: g.kickoff,
+      home: g.home,
+      away: g.away,
+      markets: [{ key: 'h2h', name: 'Match Result', type: 'h2h', outcomes: prior }],
+    };
+    const offersByMarket = new Map([['h2h', offers]]);
+    const kickoffHours = Math.max(0, (g.kickoff - Date.now()) / 3600000);
+    const priced = priceEventFromOffers(event, offersByMarket, { tier: g.league.tier, kickoffHours });
+
+    const eventLegs = extractLegs({ ...event, markets: priced.markets });
+    for (const l of eventLegs) { l.live = true; l.truthProb = null; }
+    legs.push(...eventLegs);
+    events.push({
+      eventId: g.id, sport: g.sport, league: g.league.name,
+      home: g.home.name, away: g.away.name, kickoff: g.kickoff,
+      legs: eventLegs.length, live: true,
+    });
+  }
+
+  return {
+    dayKey,
+    legs,
+    events,
+    diagnostics: {
+      dayKey,
+      tz,
+      provider: 'oddsapi',
+      events: events.length,
+      markets: marketsSeen,
+      pricesQuoted,
+      books: [...bookNames].sort(),
+      bookCount: bookNames.size,
+      bookQuotes: pricesQuoted,
+      skippedNotOnDay: skippedNoFixture,
+      truthKnown: false,
+      scope: 'head-to-head only — see scanLiveGames',
+      fetchedAt: new Date().toISOString(),
+    },
+    report: {
+      target: opts.builder?.targetOdds ?? 2,
+      scanned: games.length,
+      events: events.length,
+      eligible: legs.length,
+      positiveEdge: legs.filter((l) => l.edge > 0).length,
+    },
+  };
+}
+
+/**
+ * A flat-ish prior over whatever outcome names a book actually quoted.
+ *
+ * Deliberately near-uniform. We do not know these teams, and a made-up lean
+ * would be indistinguishable downstream from a real one. Home advantage is the
+ * single effect worth encoding because it holds across every sport and league in
+ * the seed table; everything else stays flat and lets the 92% of the blend that
+ * comes from the market do the work.
+ */
+function outcomePrior(names, homeName) {
+  const home = String(homeName || '');
+  const n = names.length;
+  const homeBoost = 1.12;
+  const raw = names.map((nm) => (nm === home ? homeBoost : 1));
+  const sum = raw.reduce((a, b) => a + b, 0) || 1;
+  return names.map((nm, i) => ({
+    key: nm.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 24) || `o${i}`,
+    label: nm,
+    p: round(raw[i] / sum, 4),
+  }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -3092,7 +3443,8 @@ function scanForDay(dayKey, runConfig, overrides = {}) {
     provider: runConfig.provider || 'sim',
     eventsPerDay: runConfig.eventsPerDay || 26,
     marketInefficiency: runConfig.marketInefficiency ?? 1,
-    manualOdds: overrides.manualOdds,
+    manualOdds: overrides.manualOdds ?? runConfig.manualOdds,
+    apiKey: overrides.apiKey ?? runConfig.oddsApiKey ?? runConfig.apiKey ?? '',
     ...overrides,
   };
   const scan = scanDay(dayKey, opts);
@@ -3151,7 +3503,7 @@ async function fetchOddsApi(sports, apiKey, { daysAhead = 2 } = {}) {
 function normaliseOddsApiGame(g, meta) {
   const books = (g.bookmakers || []).map((b) => ({
     name: b.title,
-    cls: /pinnacle|sbobet|circa|cris/i.test(b.title) ? 'sharp' : /bet365|unibet|william/i.test(b.title) ? 'mid' : 'soft',
+    cls: classifyBook(b.title),
     markets: b.markets,
   }));
   return {
@@ -3195,17 +3547,18 @@ function* enumerate(arr) {
 function mean(a) {
   return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
 }
-__exp_33 = scanForDay;
-__exp_34 = scanDay;
-__exp_35 = PROVIDERS;
-__exp_36 = fetchOddsApi;
+__exp_35 = scanForDay;
+__exp_36 = scanDay;
+__exp_37 = scanDayLive;
+__exp_38 = PROVIDERS;
+__exp_39 = fetchOddsApi;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/settle.js   →  hoists settleLegs, settleByTruthProb
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_37;
-let __exp_38;
+let __exp_40;
+let __exp_41;
 {
 const simulateResult = __exp_16;
 const makeRng = __exp_8;
@@ -3328,16 +3681,16 @@ function buildEventsFor(dayKey, ctx) {
 async function initSettle() {
   return true;
 }
-__exp_37 = settleLegs;
-__exp_38 = settleByTruthProb;
+__exp_40 = settleLegs;
+__exp_41 = settleByTruthProb;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/suggestions.js   →  hoists suggestNextRun, suggestRecovery, money
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_39;
-let __exp_40;
-let __exp_41;
+let __exp_42;
+let __exp_43;
+let __exp_44;
 {
 const clamp = __exp_6;
 const round = __exp_7;
@@ -3770,17 +4123,14 @@ function money(code, n) {
   const sym = { NGN: '₦', USD: '$', GBP: '£', EUR: '€', GHS: '₵', KES: 'KSh', ZAR: 'R' }[code] || `${code} `;
   return `${sym}${Number(n ?? 0).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
-__exp_39 = suggestNextRun;
-__exp_40 = suggestRecovery;
-__exp_41 = money;
+__exp_42 = suggestNextRun;
+__exp_43 = suggestRecovery;
+__exp_44 = money;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/rollover.js   →  hoists createRun, scanRunDay, confirmDay, settleDay, chooseAlternative, adjustDayOdds, skipDay, rescanDay, abandonRun, restartRun, runProgress, dayCards, equityCurve, RUN_STATUS, DAY_STATUS
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_42;
-let __exp_43;
-let __exp_44;
 let __exp_45;
 let __exp_46;
 let __exp_47;
@@ -3793,20 +4143,23 @@ let __exp_53;
 let __exp_54;
 let __exp_55;
 let __exp_56;
+let __exp_57;
+let __exp_58;
+let __exp_59;
 {
 const makeRng = __exp_8;
 const round = __exp_7;
 const clamp = __exp_6;
 const mean = __exp_10;
-const scanForDay = __exp_33;
-const settleLegs = __exp_37;
+const scanForDay = __exp_35;
+const settleLegs = __exp_40;
 const tzDateKey = __exp_19;
 const tzNowParts = __exp_20;
 const upcomingDays = __exp_22;
 const formatKickoff = __exp_21;
 const zonedTimeToMs = __exp_23;
-const suggestNextRun = __exp_39;
-const suggestRecovery = __exp_40;
+const suggestNextRun = __exp_42;
+const suggestRecovery = __exp_43;
 
 /**
  * rollover.js — the rollover state machine.
@@ -4018,7 +4371,14 @@ function scanRunDay(run, dayNumber = run.currentDay, overrides = {}) {
   day.slip = slip;
   day.scan = {
     scannedAt: new Date().toISOString(),
-    provider: diagnostics.provider,
+    /* Not just which provider answered — which one was asked for, and why it
+     * wasn't honoured if it wasn't. A run priced off invented numbers must never
+     * be indistinguishable from one priced off real ones, including weeks later
+     * when you are reading the history and can no longer remember. */
+    provider: diagnostics.providerUsed ?? diagnostics.provider,
+    providerRequested: diagnostics.providerRequested ?? diagnostics.provider,
+    providerFellBack: Boolean(diagnostics.fellBack),
+    providerFallbackReason: diagnostics.fallbackReason ?? null,
     eventsScanned: diagnostics.events,
     marketsScanned: diagnostics.markets,
     pricesQuoted: diagnostics.pricesQuoted,
@@ -4523,29 +4883,29 @@ const cur = (code) => SYMBOLS[code] || `${code} `;
 const fmt = (n) =>
   Number(n ?? 0).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const money = (code, n) => `${cur(code)}${fmt(n)}`;
-__exp_42 = createRun;
-__exp_43 = scanRunDay;
-__exp_44 = confirmDay;
-__exp_45 = settleDay;
-__exp_46 = chooseAlternative;
-__exp_47 = adjustDayOdds;
-__exp_48 = skipDay;
-__exp_49 = rescanDay;
-__exp_50 = abandonRun;
-__exp_51 = restartRun;
-__exp_52 = runProgress;
-__exp_53 = dayCards;
-__exp_54 = equityCurve;
-__exp_55 = RUN_STATUS;
-__exp_56 = DAY_STATUS;
+__exp_45 = createRun;
+__exp_46 = scanRunDay;
+__exp_47 = confirmDay;
+__exp_48 = settleDay;
+__exp_49 = chooseAlternative;
+__exp_50 = adjustDayOdds;
+__exp_51 = skipDay;
+__exp_52 = rescanDay;
+__exp_53 = abandonRun;
+__exp_54 = restartRun;
+__exp_55 = runProgress;
+__exp_56 = dayCards;
+__exp_57 = equityCurve;
+__exp_58 = RUN_STATUS;
+__exp_59 = DAY_STATUS;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/simulate.js   →  hoists runSimulation, projectRun, STRATEGIES
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_57;
-let __exp_58;
-let __exp_59;
+let __exp_60;
+let __exp_61;
+let __exp_62;
 {
 const makeRng = __exp_8;
 const clamp = __exp_6;
@@ -4557,12 +4917,12 @@ const stdev = __exp_11;
 const buildDayEvents = __exp_18;
 const tzDateKey = __exp_19;
 const priceEvent = __exp_28;
-const extractLegs = __exp_29;
+const extractLegs = __exp_30;
 const correlationFactor = __exp_27;
 const applyMarketInformation = __exp_26;
-const buildRolloverSlip = __exp_31;
-const DEFAULT_BUILDER_OPTS = __exp_32;
-const settleByTruthProb = __exp_38;
+const buildRolloverSlip = __exp_33;
+const DEFAULT_BUILDER_OPTS = __exp_34;
+const settleByTruthProb = __exp_41;
 
 /**
  * simulate.js — the honesty machine.
@@ -5037,41 +5397,42 @@ function projectRun({
       : `At ${round(p * 100, 2)}% a day this rollover breaks even or worse. You are paying for variance, not value.`,
   };
 }
-__exp_57 = runSimulation;
-__exp_58 = projectRun;
-__exp_59 = STRATEGIES;
+__exp_60 = runSimulation;
+__exp_61 = projectRun;
+__exp_62 = STRATEGIES;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/http-core.js   →  hoists createApi, ENGINE_INFO, runPayload, dayPayload, projectFor, jsonSafe
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_60;
-let __exp_61;
-let __exp_62;
 let __exp_63;
 let __exp_64;
 let __exp_65;
+let __exp_66;
+let __exp_67;
+let __exp_68;
 {
-const createRun = __exp_42;
-const scanRunDay = __exp_43;
-const confirmDay = __exp_44;
-const settleDay = __exp_45;
-const chooseAlternative = __exp_46;
-const adjustDayOdds = __exp_47;
-const skipDay = __exp_48;
-const rescanDay = __exp_49;
-const abandonRun = __exp_50;
-const restartRun = __exp_51;
-const runProgress = __exp_52;
-const dayCards = __exp_53;
-const equityCurve = __exp_54;
-const scanDay = __exp_34;
-const scanForDay = __exp_33;
-const PROVIDERS = __exp_35;
-const fetchOddsApi = __exp_36;
-const SIGNAL_WEIGHTS = __exp_30;
-const runSimulation = __exp_57;
-const projectRun = __exp_58;
+const createRun = __exp_45;
+const scanRunDay = __exp_46;
+const confirmDay = __exp_47;
+const settleDay = __exp_48;
+const chooseAlternative = __exp_49;
+const adjustDayOdds = __exp_50;
+const skipDay = __exp_51;
+const rescanDay = __exp_52;
+const abandonRun = __exp_53;
+const restartRun = __exp_54;
+const runProgress = __exp_55;
+const dayCards = __exp_56;
+const equityCurve = __exp_57;
+const scanDay = __exp_36;
+const scanForDay = __exp_35;
+const scanDayLive = __exp_37;
+const PROVIDERS = __exp_38;
+const fetchOddsApi = __exp_39;
+const SIGNAL_WEIGHTS = __exp_32;
+const runSimulation = __exp_60;
+const projectRun = __exp_61;
 const upcomingDays = __exp_22;
 const tzNowParts = __exp_20;
 const tzDateKey = __exp_19;
@@ -5121,6 +5482,17 @@ function jsonSafe(key, value) {
   if (value instanceof Set) return [...value];
   if (value instanceof Map) return Object.fromEntries(value);
   return value;
+}
+
+/**
+ * Serialise a value the way the wire will, Sets and Maps included.
+ *
+ * `jsonSafe` is a JSON.stringify REVIVER — its first parameter is the key. Calling
+ * it as `jsonSafe(obj)` silently returns undefined, which is how a whole route
+ * once shipped an empty body. Route handlers should use this.
+ */
+function toPlain(value) {
+  return JSON.parse(JSON.stringify(value, jsonSafe));
 }
 
 function clampInt(v, lo, hi, dflt) {
@@ -5333,9 +5705,15 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
   }
 
   return async function api({ method, pathname, query, body = {} }) {
+    /* Every host normalises differently — server/index.js builds URLSearchParams
+     * from the request, api/index.js from the Vercel URL, and a test may pass a
+     * raw string. Coerce once so a malformed query is an empty one rather than a
+     * TypeError that takes the whole handler down. */
+    const q = query instanceof URLSearchParams
+      ? query
+      : new URLSearchParams(typeof query === 'string' ? query : '');
     const p = String(pathname || '').replace(/\/+$/, '');
     const seg = p.split('/').filter(Boolean); // ['api', ...]
-    const q = query || new URLSearchParams();
 
     if (method === 'GET' && p === '/api/state') return { status: 200, body: await statePayload() };
 
@@ -5365,11 +5743,18 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
       const settings = await store.getSettings();
       const date = q.get('date') || tzDateKey(new Date(), settings.tz);
       const eventsPerDay = Number(q.get('events') || settings.eventsPerDay);
+      /* Honour the requested provider, and report which one actually answered.
+       * Hardcoding 'sim' here meant a user who selected "The Odds API" and pasted
+       * a key was silently shown invented prices — the worst failure mode this
+       * engine has, because it looks exactly like success. */
+      const wantProvider = q.get('provider') || settings.provider || 'sim';
       const scan = scanDay(date, {
         tz: settings.tz,
-        provider: 'sim',
+        provider: wantProvider,
         eventsPerDay,
         marketInefficiency: settings.marketInefficiency,
+        apiKey: q.get('apiKey') || settings.oddsApi?.key || env.ODDS_API_KEY || '',
+        manualOdds: settings.manualOdds,
       });
       const { builder } = scanForDay(date, {
         tz: settings.tz,
@@ -5385,6 +5770,14 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
         status: 200,
         body: {
           date,
+          /* Which provider was asked for and which one actually answered.
+           * `fellBack` is the flag the UI must never hide. */
+          provider: {
+            requested: scan.diagnostics?.providerRequested ?? wantProvider,
+            used: scan.diagnostics?.providerUsed ?? 'sim',
+            fellBack: Boolean(scan.diagnostics?.fellBack),
+            reason: scan.diagnostics?.fallbackReason ?? null,
+          },
           diagnostics: scan.diagnostics,
           builder: builder.ok ? builder : { ok: false, reason: builder.reason, message: builder.message, report: builder.report },
           events: scan.events.map(briefEvent),
@@ -5565,6 +5958,53 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
       };
     }
 
+    /* The live scan. Async because fetching nine leagues cannot be done inside
+     * the synchronous scan path. Throws rather than falling back: "I could not
+     * get you live prices" and "here are live prices" are not interchangeable. */
+    if ((method === 'POST' || method === 'GET') && p === '/api/scan/live') {
+      const settings = await store.getSettings();
+      const src = method === 'POST' ? (body || {}) : Object.fromEntries(q);
+      const key = src.apiKey || settings.oddsApi?.key || env.ODDS_API_KEY;
+      const date = src.date || tzDateKey(new Date(), settings.tz);
+      if (!key) {
+        return {
+          status: 400,
+          body: {
+            error: 'No API key. Set ODDS_API_KEY or paste one in settings.',
+            hint: 'https://the-odds-api.com — the free tier is enough. Until a key is present every scan is simulated, and says so.',
+          },
+        };
+      }
+      try {
+        const res = await scanDayLive(date, {
+          tz: settings.tz,
+          apiKey: key,
+          sports: src.sports,
+          daysAhead: Number(src.daysAhead || 2),
+          builder: {
+            targetOdds: Number(src.odds || settings.targetOdds),
+            tolerance: Number(src.tolerance ?? settings.tolerance),
+            mode: src.mode || settings.mode,
+          },
+        });
+        return {
+          status: 200,
+          body: {
+            dayKey: date,
+            provider: { requested: 'oddsapi', used: 'oddsapi', fellBack: false, reason: null },
+            scan: toPlain(res.scan),
+            builder: toPlain(res.builder),
+            diagnostics: toPlain(res.diagnostics),
+            truthKnown: false,
+            note: 'Live prices. truthProb and calibration are null on purpose — with real fixtures nobody knows the answer yet.',
+          },
+        };
+      } catch (err) {
+        const status = err.code === 'NO_KEY' ? 400 : err.code === 'NO_GAMES' ? 502 : 502;
+        return { status, body: { error: err.message, code: err.code || 'FETCH_FAILED' } };
+      }
+    }
+
     if (method === 'POST' && p === '/api/odds/live') {
       const settings = await store.getSettings();
       const key = body.apiKey || settings.oddsApi?.key || env.ODDS_API_KEY;
@@ -5585,20 +6025,20 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
     return { status: 404, body: { error: `no route for ${method} ${p}` } };
   };
 }
-__exp_60 = createApi;
-__exp_61 = ENGINE_INFO;
-__exp_62 = runPayload;
-__exp_63 = dayPayload;
-__exp_64 = projectFor;
-__exp_65 = jsonSafe;
+__exp_63 = createApi;
+__exp_64 = ENGINE_INFO;
+__exp_65 = runPayload;
+__exp_66 = dayPayload;
+__exp_67 = projectFor;
+__exp_68 = jsonSafe;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/store-shared.js   →  hoists DEFAULT_SETTINGS, summariseRun, reviveRun
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_66;
-let __exp_67;
-let __exp_68;
+let __exp_69;
+let __exp_70;
+let __exp_71;
 {
 /**
  * store-shared.js — the parts of persistence that every backend must agree on.
@@ -5670,21 +6110,21 @@ function reviveRun(run) {
   }
   return run;
 }
-__exp_66 = DEFAULT_SETTINGS;
-__exp_67 = summariseRun;
-__exp_68 = reviveRun;
+__exp_69 = DEFAULT_SETTINGS;
+__exp_70 = summariseRun;
+__exp_71 = reviveRun;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/memory-store.js   →  hoists createLocalStorageStore, createStoreAdapter, createMemoryStore
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_69;
-let __exp_70;
-let __exp_71;
+let __exp_72;
+let __exp_73;
+let __exp_74;
 {
-const DEFAULT_SETTINGS = __exp_66;
-const summariseRun = __exp_67;
-const reviveRun = __exp_68;
+const DEFAULT_SETTINGS = __exp_69;
+const summariseRun = __exp_70;
+const reviveRun = __exp_71;
 
 /**
  * memory-store.js — a storage adapter with a pluggable backend.
@@ -5896,12 +6336,12 @@ function createLocalStorageStore(key = 'rolloverengine.store.v1', opts) {
   store.evictions = evictions;
   return store;
 }
-__exp_69 = createLocalStorageStore;
-__exp_70 = createStoreAdapter;
-__exp_71 = createMemoryStore;
+__exp_72 = createLocalStorageStore;
+__exp_73 = createStoreAdapter;
+__exp_74 = createMemoryStore;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    facade — 44 public bindings
    ════════════════════════════════════════════════════════════════════════ */
-export { __exp_7 as round, __exp_6 as clamp, __exp_10 as mean, __exp_22 as upcomingDays, __exp_19 as tzDateKey, __exp_20 as tzNowParts, __exp_24 as dayShape, __exp_31 as buildRolloverSlip, __exp_32 as DEFAULT_BUILDER_OPTS, __exp_34 as scanDay, __exp_33 as scanForDay, __exp_35 as PROVIDERS, __exp_39 as suggestNextRun, __exp_40 as suggestRecovery, __exp_41 as money, __exp_42 as createRun, __exp_43 as scanRunDay, __exp_44 as confirmDay, __exp_45 as settleDay, __exp_48 as skipDay, __exp_49 as rescanDay, __exp_51 as restartRun, __exp_50 as abandonRun, __exp_46 as chooseAlternative, __exp_47 as adjustDayOdds, __exp_52 as runProgress, __exp_53 as dayCards, __exp_54 as equityCurve, __exp_55 as RUN_STATUS, __exp_56 as DAY_STATUS, __exp_57 as runSimulation, __exp_58 as projectRun, __exp_59 as STRATEGIES, __exp_60 as createApi, __exp_61 as ENGINE_INFO, __exp_62 as runPayload, __exp_63 as dayPayload, __exp_64 as projectFor, __exp_65 as jsonSafe, __exp_66 as DEFAULT_SETTINGS, __exp_67 as summariseRun, __exp_69 as createLocalStorageStore, __exp_70 as createStoreAdapter, __exp_71 as createMemoryStore };
+export { __exp_7 as round, __exp_6 as clamp, __exp_10 as mean, __exp_22 as upcomingDays, __exp_19 as tzDateKey, __exp_20 as tzNowParts, __exp_24 as dayShape, __exp_33 as buildRolloverSlip, __exp_34 as DEFAULT_BUILDER_OPTS, __exp_36 as scanDay, __exp_35 as scanForDay, __exp_38 as PROVIDERS, __exp_42 as suggestNextRun, __exp_43 as suggestRecovery, __exp_44 as money, __exp_45 as createRun, __exp_46 as scanRunDay, __exp_47 as confirmDay, __exp_48 as settleDay, __exp_51 as skipDay, __exp_52 as rescanDay, __exp_54 as restartRun, __exp_53 as abandonRun, __exp_49 as chooseAlternative, __exp_50 as adjustDayOdds, __exp_55 as runProgress, __exp_56 as dayCards, __exp_57 as equityCurve, __exp_58 as RUN_STATUS, __exp_59 as DAY_STATUS, __exp_60 as runSimulation, __exp_61 as projectRun, __exp_62 as STRATEGIES, __exp_63 as createApi, __exp_64 as ENGINE_INFO, __exp_65 as runPayload, __exp_66 as dayPayload, __exp_67 as projectFor, __exp_68 as jsonSafe, __exp_69 as DEFAULT_SETTINGS, __exp_70 as summariseRun, __exp_72 as createLocalStorageStore, __exp_73 as createStoreAdapter, __exp_74 as createMemoryStore };
