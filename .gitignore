@@ -1,0 +1,8 @@
+node_modules/
+data/*.json
+!data/.gitkeep
+.DS_Store
+*.log
+.env
+.vercel/
+dist/
