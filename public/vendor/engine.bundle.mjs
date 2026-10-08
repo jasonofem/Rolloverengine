@@ -4447,13 +4447,24 @@ function scanRunDay(run, dayNumber = run.currentDay, overrides = {}) {
     builderCfg.targetOdds = day.targetOdds + cfg.tolerance;
   }
 
-  const { scan, builder, diagnostics } = scanForDay(day.date, {
-    tz: cfg.tz,
-    provider: overrides.provider || cfg.provider,
-    eventsPerDay: cfg.eventsPerDay,
-    marketInefficiency: cfg.marketInefficiency,
-    builder: builderCfg,
-  }, overrides);
+  /* A prepared board — a live scan the route awaited, or one the dashboard
+   * handed over — skips the synchronous scan. Fetching real prices is async;
+   * the honest alternative to awaiting them used to be falling back to the
+   * simulator on the exact day money gets staked, which is how a run could
+   * open on invented fixtures while a real key sat unused in settings. */
+  const { scan, builder, diagnostics } = overrides.prepared
+    ? {
+        scan: overrides.prepared.scan,
+        builder: overrides.prepared.builder,
+        diagnostics: overrides.prepared.scan?.diagnostics || {},
+      }
+    : scanForDay(day.date, {
+        tz: cfg.tz,
+        provider: overrides.provider || cfg.provider,
+        eventsPerDay: cfg.eventsPerDay,
+        marketInefficiency: cfg.marketInefficiency,
+        builder: builderCfg,
+      }, overrides);
 
   const stake = round(stakeFor(run.balance, cfg), 2);
   const chosen = builder.ok ? builder.best : builder.fallback;
@@ -5579,7 +5590,7 @@ const tzDateKey = __exp_19;
 
 const ENGINE_INFO = {
   name: 'RolloverEngine',
-  version: '1.1.4',
+  version: '1.1.5',
   signalWeights: SIGNAL_WEIGHTS,
   notes: [
     'Prices are de-vigged across all quoting books before anything else is measured.',
@@ -5700,6 +5711,12 @@ function dayPayload(d) {
       ? {
           scannedAt: d.scan.scannedAt,
           provider: d.scan.provider,
+          /* The provider story travels with every payload: a run priced off
+           * invented numbers must say so wherever it is rendered, including
+           * weeks later from history. */
+          providerRequested: d.scan.providerRequested ?? d.scan.provider,
+          providerFellBack: Boolean(d.scan.providerFellBack),
+          providerFallbackReason: d.scan.providerFallbackReason ?? null,
           eventsScanned: d.scan.eventsScanned,
           marketsScanned: d.scan.marketsScanned,
           pricesQuoted: d.scan.pricesQuoted,
@@ -5789,6 +5806,46 @@ function briefEvent(e) {
  * @param {number} [opts.maxIterations] cap on Monte-Carlo iterations
  * @returns {(req:{method:string,pathname:string,query:URLSearchParams,body:object}) => Promise<{status:number,body:object}>}
  */
+/**
+ * Real fixtures for the day being priced, whenever a key exists to fetch them.
+ *
+ * The synchronous scan cannot await the network, so before this helper every
+ * run opened on simulated prices no matter what was in settings — the one day
+ * money gets staked was the one day the engine went blind. Routes now await
+ * `scanDayLive` here and hand the result to `scanRunDay` as a prepared board.
+ *
+ * Three honest exits, in order: a board the dashboard already fetched (the
+ * browser-bundle case, where the route itself must not refetch); a live fetch
+ * on server-shaped hosts; and `{}` — meaning "I could not get live prices",
+ * which lets the sync path run and stamp its own loud fallback. A failure to
+ * fetch is never disguised as a success, and a success is never invented.
+ */
+async function livePreparedFor(env, body, settings, dateKey, board) {
+  if (settings.provider !== 'oddsapi') return {};
+  if (board?.scan && board?.builder) return { prepared: { scan: board.scan, builder: board.builder } };
+  /* In a browser bundle the route has no server-side key and no business
+   * firing cross-origin requests with someone's key in the URL; the dashboard
+   * fetches the board through its own origin and hands it over instead. */
+  if (globalThis.window !== undefined) return {};
+  const key = body.apiKey || settings.oddsApi?.key || env.ODDS_API_KEY || '';
+  if (!key || !dateKey) return {};
+  try {
+    const live = await scanDayLive(dateKey, {
+      tz: settings.tz,
+      apiKey: key,
+      sports: settings.oddsApi?.sports || [],
+      builder: {
+        targetOdds: settings.targetOdds,
+        tolerance: settings.tolerance,
+        mode: settings.mode,
+      },
+    });
+    return { prepared: { scan: live.scan, builder: live.builder } };
+  } catch {
+    return {};
+  }
+}
+
 function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } = {}) {
   const startedAt = Date.now();
 
@@ -5939,7 +5996,7 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
           builder: { mode: merged.mode, minEdgePerLeg: merged.minEdgePerLeg, maxLegs: merged.maxLegs },
         },
       });
-      scanRunDay(run, 1);
+      scanRunDay(run, 1, await livePreparedFor(env, body, merged, run.days[0].date, body.liveBoard));
       await store.saveRun(run);
       return { status: 201, body: { run: runPayload(run), projection: projectFor(run) } };
     }
@@ -5964,7 +6021,14 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
 
       switch (action) {
         case 'scan': {
-          rescanDay(run, body.day ?? run.currentDay, body.overrides || {});
+          const settings = await store.getSettings();
+          const dayNum = body.day ?? run.currentDay;
+          const day = run.days.find((d) => d.day === dayNum);
+          const overrides = body.overrides || {};
+          if (!overrides.prepared) {
+            Object.assign(overrides, await livePreparedFor(env, body, settings, day?.date, body.liveBoard));
+          }
+          rescanDay(run, dayNum, overrides);
           await store.saveRun(run);
           return { status: 200, body: { run: runPayload(run), projection: projectFor(run) } };
         }

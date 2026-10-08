@@ -87,7 +87,7 @@ async function chooseTransport() {
    * run a seven-day rollover is this tab — a run must never live somewhere
    * that can silently forget it. */
   try {
-    const mod = await import('./local-api.js?v=1.1.4'); // stamped: see index.html
+    const mod = await import('./local-api.js?v=1.1.5'); // stamped: see index.html
     transport = mod.localFetch;
 
     const info = mod.storageInfo();
@@ -874,9 +874,16 @@ function wireSlip(day, r) {
       b.disabled = true;
       try {
         if (act === 'scan') {
-          const { run, projection } = await api(`/api/runs/${r.id}/scan`, { method: 'POST', body: { day: day.day } });
+          let overrides = {};
+          if (transport && S.settings?.provider === 'oddsapi') {
+            const board = await fetchLiveBoard({ date: day.date, odds: r.config?.targetOdds, tolerance: r.config?.tolerance });
+            if (board) overrides = { prepared: board };
+          }
+          const { run, projection } = await api(`/api/runs/${r.id}/scan`, { method: 'POST', body: { day: day.day, overrides } });
           S.run = run; S.projection = projection; renderAll();
-          toast('Market rescanned', run.days.find((d) => d.day === run.currentDay)?.slip ? 'New slip ready' : 'Still nothing above the edge floor', 'ok');
+          const d = run.days.find((x) => x.day === run.currentDay);
+          const live = d?.scan?.provider === 'oddsapi' && !d?.scan?.providerFellBack;
+          toast(live ? 'Live rescan done' : 'Market rescanned', d?.slip ? `New slip ready${live ? ' — real fixtures' : ''}` : 'Still nothing above the edge floor', 'ok');
         } else if (act === 'stake') {
           const { run, projection } = await api(`/api/runs/${r.id}/stake`, { method: 'POST', body: { day: day.day } });
           S.run = run; S.projection = projection; renderAll();
@@ -1241,7 +1248,18 @@ async function createRun() {
   }, 20000);
   try {
     await api('/api/settings', { method: 'POST', body: { currency: body.currency } });
-    const { run, projection } = await api('/api/runs', { method: 'POST', body });
+    /* In browser-local mode the run route cannot fetch live prices itself, so
+     * the dashboard fetches the board through its own origin first and hands
+     * it over. On a real server the route does its own live fetch and this
+     * step is skipped entirely. */
+    let liveBoard = null;
+    if (transport && body.provider === 'oddsapi') {
+      liveBoard = await fetchLiveBoard({ date: body.startDay, odds: body.targetOdds, tolerance: body.tolerance });
+    }
+    const { run, projection } = await api('/api/runs', {
+      method: 'POST',
+      body: liveBoard ? { ...body, liveBoard } : body,
+    });
     const st = await api('/api/state');
     S.state = st; S.settings = st.settings;
     S.run = run; S.projection = projection;
@@ -1249,7 +1267,8 @@ async function createRun() {
     renderAll();
     switchTab('dashboard');
     const day1 = run.days[0];
-    if (day1.slip) toast('Rollover started', `Day 1: ${day1.slip.legCount} legs at ${day1.slip.odds.toFixed(2)} · ${pct(day1.slip.winProbPct)} modelled`, 'ok', 7000);
+    const day1Live = day1.scan?.provider === 'oddsapi' && !day1.scan?.providerFellBack;
+    if (day1.slip) toast(day1Live ? 'Rollover started on LIVE prices' : 'Rollover started', `Day 1: ${day1.slip.legCount} legs at ${day1.slip.odds.toFixed(2)} · ${pct(day1.slip.winProbPct)} modelled${day1Live ? ' · real fixtures' : ''}`, 'ok', 7000);
     else toast('Rollover created', 'The engine found nothing above the edge floor for day 1 — try a rescan or a different start date.', 'warn', 8000);
   } catch (err) {
     /* Toasts fly away; this box stays until the modal closes. */
@@ -1366,6 +1385,36 @@ $('#btn-save-settings').addEventListener('click', saveSettings);
  * the engine has no business holding your API key and calling bookmakers
  * direct — and browser CORS would refuse most of it anyway.
  * ------------------------------------------------------------------ */
+/**
+ * Fetch a real-fixture board through this origin's live scanner, for run
+ * creation and rescans in browser-local mode. Returns null on any failure —
+ * the caller then lets the engine stamp its own honest fallback instead of
+ * pretending. Never throws, never blocks the flow for more than 15s.
+ */
+async function fetchLiveBoard({ date, odds, tolerance } = {}) {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 15000);
+    const res = await fetch('/api/scan/live', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: ctl.signal,
+      body: JSON.stringify({
+        apiKey: $('#s-apikey')?.value?.trim() || S.settings?.oddsApi?.key || '',
+        date: date || undefined,
+        odds,
+        tolerance,
+      }),
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const j = await res.json();
+    return j?.scan && j?.builder ? { scan: j.scan, builder: j.builder } : null;
+  } catch {
+    return null;
+  }
+}
+
 async function liveScan() {
   const btn = $('#btn-live-scan');
   const slot = $('#live-slot');

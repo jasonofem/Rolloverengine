@@ -1549,6 +1549,51 @@ describe('live odds — quota, multi-sport, and pasted prices', () => {
     assert.ok(body.run?.days?.[0], 'a run came back through the classic bridge');
   });
 
+  test('run creation prices day 1 from live fixtures when a key exists', async () => {
+    const { createApi } = await import('../lib/http-core.js');
+    const { createMemoryStore } = await import('../lib/memory-store.js');
+    const api = createApi({ store: createMemoryStore(), env: {}, persistent: false });
+    const dayKey = new Date(Date.now() + 20 * 3600e3).toISOString().slice(0, 10);
+    await api({ method: 'POST', pathname: '/api/settings', query: new URLSearchParams(), body: { tz: 'UTC' } });
+    await withFetch(okFetch, async () => {
+      const out = await api({
+        method: 'POST', pathname: '/api/runs', query: new URLSearchParams(),
+        body: { stake: 500, currency: 'NGN', days: 7, targetOdds: 2, tolerance: 0.35, mode: 'balanced', provider: 'oddsapi', apiKey: 'test-key', startDay: dayKey },
+      });
+      assert.equal(out.status, 201);
+      const day = out.body.run.days[0];
+      assert.equal(day.scan.provider, 'oddsapi', 'day 1 must carry the live provider, not a silent sim');
+      assert.equal(day.scan.providerFellBack, false);
+      assert.ok(day.scan.books.includes('Pinnacle'), 'real book names, not simulated ones');
+    });
+  });
+
+  test('a dashboard-fetched board prices the run with zero network access', async () => {
+    const { createApi } = await import('../lib/http-core.js');
+    const { createMemoryStore } = await import('../lib/memory-store.js');
+    const api = createApi({ store: createMemoryStore(), env: {}, persistent: false });
+    const dayKey = new Date(Date.now() + 20 * 3600e3).toISOString().slice(0, 10);
+    await api({ method: 'POST', pathname: '/api/settings', query: new URLSearchParams(), body: { tz: 'UTC' } });
+    let board = null;
+    await withFetch(okFetch, async () => {
+      const j = await api({ method: 'POST', pathname: '/api/scan/live', query: new URLSearchParams(), body: { apiKey: 'test-key', date: dayKey } });
+      assert.equal(j.status, 200);
+      board = { scan: j.body.scan, builder: j.body.builder };
+    });
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('the route must not refetch when handed a board'); };
+    try {
+      const out = await api({
+        method: 'POST', pathname: '/api/runs', query: new URLSearchParams(),
+        body: { stake: 500, currency: 'NGN', days: 7, targetOdds: 2, tolerance: 0.35, mode: 'balanced', provider: 'oddsapi', startDay: dayKey, liveBoard: board },
+      });
+      assert.equal(out.status, 201);
+      const day = out.body.run.days[0];
+      assert.equal(day.scan.provider, 'oddsapi');
+      assert.ok(day.scan.books.includes('Pinnacle'));
+    } finally { globalThis.fetch = real; }
+  });
+
   test('pasted prices become a real slip: settings → scan → builder', async () => {
     const { createApi } = await import('../lib/http-core.js');
     const { createMemoryStore } = await import('../lib/memory-store.js');
