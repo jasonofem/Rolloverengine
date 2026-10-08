@@ -1242,7 +1242,7 @@ const LIVE_FIXTURES = {
     bookmakers: [
       { key: 'pinnacle', title: 'Pinnacle', markets: [
         { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.42 }, { name: 'Everton', price: 8.1 }, { name: 'Draw', price: 5.05 }] },
-        { key: 'totals', outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 1.95 }] },
+        { key: 'totals', point: 2.5, outcomes: [{ name: 'Over', price: 1.9, point: 2.5 }, { name: 'Under', price: 1.95, point: 2.5 }] },
       ] },
       { key: 'bet365', title: 'Bet365', markets: [
         { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.4 }, { name: 'Everton', price: 8.0 }, { name: 'Draw', price: 4.8 }] },
@@ -1320,12 +1320,16 @@ describe('live odds — real quotes, and never a silent simulation', () => {
     }
   });
 
-  test('prices only head-to-head, and says so rather than half-pricing the rest', async () => {
+  test('prices every market the books quote on both sides, and says which', async () => {
     const res = await withFetch(okFetch, () => scanDayLive(dayKey, liveOpts));
-    assert.match(res.diagnostics.scope, /head-to-head/i);
-    assert.ok(res.scan.legs.every((l) => l.marketType === 'h2h'), 'the totals market was not invented a model for');
-    // 3 outcomes on the football game + 2 on the basketball game.
-    assert.equal(res.scan.legs.length, 5);
+    assert.match(res.diagnostics.scope, /totals/i, 'the scope line names the widened market set');
+    const types = new Set(res.scan.legs.map((l) => l.marketType));
+    assert.ok(types.has('h2h') && types.has('totals'), `h2h + totals expected, got ${[...types].join(',')}`);
+    // 3 h2h outcomes + 2 total outcomes on the football game, 2 on the basketball game.
+    assert.equal(res.scan.legs.length, 7);
+    const over = res.scan.legs.find((l) => l.marketType === 'totals' && l.pick === 'Over');
+    assert.ok(over, 'a one-book total is still priced — with the confidence that one book earns');
+    assert.ok(Number.isFinite(over.edge));
   });
 
   test('builds a real slip from live prices', async () => {
@@ -1475,6 +1479,74 @@ describe('live odds — quota, multi-sport, and pasted prices', () => {
       await fetchOddsApi(['basketball_nba', 'tennis_atp'], 'k', {});
       assert.equal(urls.length, 2, 'one request per requested key — the free tier is 500 a month');
     } finally { globalThis.fetch = real; }
+  });
+
+  test('live scan prices totals and spreads, not just 1X2', async () => {
+    const { scanDayLive } = await import('../lib/scan.js');
+    const d = new Date();
+    const commence = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 12, 0, 0)).toISOString();
+    const dayKey = commence.slice(0, 10);
+    const game = {
+      id: 'mm1',
+      commence_time: commence,
+      home_team: 'Lakers',
+      away_team: 'Celtics',
+      bookmakers: [
+        { title: 'Pinnacle', markets: [
+          { key: 'h2h', outcomes: [{ name: 'Lakers', price: 1.95 }, { name: 'Celtics', price: 1.95 }] },
+          { key: 'totals', point: 220.5, outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 2.0 }] },
+          { key: 'spreads', point: -1.5, outcomes: [{ name: 'Lakers', price: 1.87, point: -1.5 }, { name: 'Celtics', price: 2.03, point: 1.5 }] },
+        ] },
+        { title: 'Bet365', markets: [
+          { key: 'h2h', outcomes: [{ name: 'Lakers', price: 1.9 }, { name: 'Celtics', price: 2.0 }] },
+          { key: 'totals', point: 220.5, outcomes: [{ name: 'Over', price: 1.95 }, { name: 'Under', price: 1.95 }] },
+          { key: 'spreads', point: -1.5, outcomes: [{ name: 'Lakers', price: 1.9, point: -1.5 }, { name: 'Celtics', price: 2.0, point: 1.5 }] },
+        ] },
+      ],
+    };
+    const real = globalThis.fetch;
+    globalThis.fetch = async (u) => ({
+      ok: true,
+      headers: { get: (h) => (h === 'x-requests-remaining' ? '400' : null) },
+      json: async () => (String(u).includes('basketball_nba') ? [game] : []),
+    });
+    try {
+      const out = await scanDayLive(dayKey, { apiKey: 'k', sports: ['basketball_nba'], tz: 'UTC' });
+      const types = new Set(out.legs.map((l) => l.marketType));
+      assert.ok(types.has('h2h') && types.has('totals') && types.has('spreads'),
+        `expected all three market families, got ${[...types].join(',')}`);
+      for (const l of out.legs) {
+        assert.equal(l.live, true);
+        assert.equal(l.truthProb, null);
+        assert.ok(Number.isFinite(l.edge), 'every live leg carries a finite edge');
+      }
+      const over = out.legs.find((l) => l.marketType === 'totals' && l.pick === 'Over');
+      assert.ok(over.odds >= 1.95, 'line shopping must take the best Over price across books');
+      assert.ok(out.diagnostics.scope.includes('totals'), 'diagnostics state the widened scope honestly');
+    } finally { globalThis.fetch = real; }
+  });
+
+  test('the Vercel entry speaks classic (req, res): no bridge can hang on it', async () => {
+    const { Readable } = await import('node:stream');
+    const mod = await import('../api/index.js');
+    const handler = mod.default;
+    assert.equal(handler.length, 2, 'default export must be the two-argument Node handler');
+    const payload = JSON.stringify({ stake: 500, currency: 'NGN', days: 7, targetOdds: 2, tolerance: 0.1, mode: 'balanced', provider: 'sim' });
+    const req = Object.assign(Readable.from([Buffer.from(payload)]), {
+      method: 'POST',
+      url: '/api/runs',
+      headers: { host: 'test' },
+    });
+    const res = {
+      statusCode: 0,
+      headers: {},
+      setHeader(k, v) { this.headers[k] = v; },
+      end(d) { this.body = d; },
+    };
+    await handler(req, res);
+    assert.equal(res.statusCode, 201);
+    const body = JSON.parse(res.body);
+    assert.ok(body.run?.days?.[0], 'a run came back through the classic bridge');
   });
 
   test('pasted prices become a real slip: settings → scan → builder', async () => {

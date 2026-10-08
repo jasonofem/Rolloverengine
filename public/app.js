@@ -64,13 +64,30 @@ async function api(path, opts = {}) {
  * report the real error.
  */
 async function chooseTransport() {
+  let serverUnreachable = false;
   try {
-    const res = await fetch('/api/state', { headers: { accept: 'application/json' } });
-    if (!res.ok) return null;
-    const st = await res.json();
-    if (st?.runtime?.persistent !== false) return null; // a real server: keep using it
+    /* Bound this probe: a host whose API hangs (a serverless function stuck at
+     * its timeout, say) must not hang the dashboard's boot with it. */
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    const res = await fetch('/api/state', { headers: { accept: 'application/json' }, signal: ctl.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const st = await res.json();
+      if (st?.runtime?.persistent !== false) return null; // a real server: keep using it
+    } else {
+      serverUnreachable = true;
+    }
+  } catch {
+    serverUnreachable = true;
+  }
 
-    const mod = await import('./local-api.js?v=1.1.2'); // stamped: see index.html
+  /* Two roads lead here: the server said it has no disk that outlives a
+   * request, or it did not answer at all. In both cases the honest place to
+   * run a seven-day rollover is this tab — a run must never live somewhere
+   * that can silently forget it. */
+  try {
+    const mod = await import('./local-api.js?v=1.1.4'); // stamped: see index.html
     transport = mod.localFetch;
 
     const info = mod.storageInfo();
@@ -80,6 +97,15 @@ async function chooseTransport() {
         degraded: true,
         label: 'this tab only',
         note: 'Your browser is blocking local storage (private window, or storage disabled), so the engine is running in memory. Everything works, but nothing survives a reload — settle your run before you close the tab.',
+      };
+    }
+    if (serverUnreachable) {
+      return {
+        local: true,
+        degraded: true,
+        label: 'running locally',
+        note: `The server API on this host did not answer (timeout or error), so the engine is running entirely in your browser and saving each run to ${info.key}. Rolling, settling and tracking all work; only server-side live odds need a healthy API.`,
+        info: mod.storageInfo,
       };
     }
     return {
@@ -1346,10 +1372,13 @@ async function liveScan() {
   btn.disabled = true;
   btn.textContent = '⚡ fetching…';
   slot.innerHTML = '';
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
   try {
     const res = await fetch('/api/scan/live', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      signal: ctl.signal,
       body: JSON.stringify({
         date: $('#market-date').value || undefined,
         odds: S.settings?.targetOdds,
@@ -1357,11 +1386,25 @@ async function liveScan() {
         apiKey: $('#s-apikey')?.value?.trim() || S.settings?.oddsApi?.key || '',
       }),
     });
+    clearTimeout(timer);
     const j = await res.json().catch(() => ({}));
-    if (!res.ok) { renderLiveError(j, res.status); return; }
+    if (!res.ok) {
+      if (!j.error) {
+        j.error = res.status === 504
+          ? 'The live scanner on this host timed out (504) — the serverless function never answered. Retry once; if it persists, scan the simulated market or paste your book\'s prices instead.'
+          : `Live scan failed with status ${res.status}.`;
+      }
+      renderLiveError(j, res.status);
+      return;
+    }
     renderLive(j);
   } catch (err) {
-    renderLiveError({ error: `Could not reach the live scanner: ${err.message}` }, 0);
+    clearTimeout(timer);
+    if (err && err.name === 'AbortError') {
+      renderLiveError({ error: 'The live scanner did not answer within 15 seconds. On a serverless host that usually means the function is unhealthy — the simulated market and pasted prices still work.' }, 504);
+    } else {
+      renderLiveError({ error: `Could not reach the live scanner: ${err.message}` }, 0);
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = '⚡ Scan LIVE';

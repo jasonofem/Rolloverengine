@@ -3,8 +3,19 @@
  *
  * This is the same route table as server/index.js, because it literally is the
  * same code: lib/http-core.js defines the API once and both hosts wrap it. The
- * only thing that differs is the transport (Web Response here, node:http there)
- * and the storage backend.
+ * only things that differ are the transport and the storage backend.
+ *
+ * ── Handler signature, and why it is the old-fashioned one ──────────────────
+ * The default export is a CLASSIC Node handler, `(req, res)`. An earlier
+ * version exported the wintercg style, `(request) => Response`, which works
+ * beautifully when you call it directly and, on some Vercel Node bridges,
+ * hangs forever in production: the bridge waits for `res.end()` that never
+ * comes, the invocation burns its whole maxDuration, and every single route
+ * answers 504 while the identical code answers in milliseconds locally. The
+ * classic signature is the one every @vercel/node generation has honoured, so
+ * it is the one the deployment gets. scripts/preview-static.mjs uses the
+ * exported `webHandler` wrapper instead, so one route table still serves both
+ * host shapes.
  *
  * ── On persistence, honestly ────────────────────────────────────────────────
  * A serverless function has no writable disk that outlives the invocation.
@@ -16,8 +27,8 @@
  * /api/state. The dashboard reads that and runs the engine locally in the
  * browser tab, persisting your runs to localStorage. Same engine, same numbers,
  * nothing lost between visits — the state just lives on your device instead of
- * a server. The endpoints below still work for anything stateless: scans, the
- * calendar, the Monte-Carlo Lab and the projection.
+ * a server. It also means a function that is slow or unreachable can never
+ * block the dashboard: boot falls back to the in-browser engine either way.
  *
  * ── On duration ─────────────────────────────────────────────────────────────
  * Pricing ~42 fixtures across ~8 books takes real CPU, and the Lab runs
@@ -43,20 +54,50 @@ const api = createApi({
 /** Vercel kills a function at this many seconds. Hobby allows 60. */
 export const maxDuration = 60;
 
-export default async function handler(req) {
-  const url = new URL(req.url, 'http://localhost');
+const CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+  'access-control-allow-headers': 'content-type',
+};
+
+/** Sets and Maps don't survive JSON.stringify unless you convert them. */
+function jsonSafe(key, value) {
+  if (value instanceof Set) return [...value];
+  if (value instanceof Map) return Object.fromEntries(value);
+  return value;
+}
+
+function send(res, status, payload) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
+  res.end(JSON.stringify(payload, jsonSafe));
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/** The classic Node serverless handler — the one Vercel always honours. */
+export default async function handler(req, res) {
+  const url = new URL(req.url || '/', `http://${req.headers?.host || 'localhost'}`);
 
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: cors() });
+    res.statusCode = 204;
+    for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
+    return res.end();
   }
 
   let body = {};
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     try {
-      const raw = await req.text();
+      const raw = await readBody(req);
       body = raw ? JSON.parse(raw) : {};
     } catch {
-      return json(400, { error: 'invalid JSON body' });
+      return send(res, 400, { error: 'invalid JSON body' });
     }
   }
 
@@ -67,30 +108,48 @@ export default async function handler(req) {
       query: url.searchParams,
       body,
     });
-    return json(out.status, out.body);
+    return send(res, out.status, out.body);
   } catch (err) {
-    return json(500, { error: err.message || 'internal error' });
+    return send(res, 500, { error: err.message || 'internal error' });
   }
 }
 
-function json(status, payload) {
-  return new Response(JSON.stringify(payload, jsonSafe), {
-    status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...cors() },
-  });
-}
+/** Web Request/Response wrapper for hosts that speak wintercg (local preview). */
+export async function webHandler(request) {
+  const url = new URL(request.url);
 
-function cors() {
-  return {
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
-    'access-control-allow-headers': 'content-type',
-  };
-}
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS });
+  }
 
-/** Sets and Maps don't survive JSON.stringify unless you convert them. */
-function jsonSafe(key, value) {
-  if (value instanceof Set) return [...value];
-  if (value instanceof Map) return Object.fromEntries(value);
-  return value;
+  let body = {};
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    try {
+      const raw = await request.text();
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      return new Response(JSON.stringify({ error: 'invalid JSON body' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json; charset=utf-8', ...CORS },
+      });
+    }
+  }
+
+  try {
+    const out = await api({
+      method: request.method,
+      pathname: url.pathname,
+      query: url.searchParams,
+      body,
+    });
+    return new Response(JSON.stringify(out.body, jsonSafe), {
+      status: out.status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...CORS },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message || 'internal error' }), {
+      status: 500,
+      headers: { 'content-type': 'application/json; charset=utf-8', ...CORS },
+    });
+  }
 }
