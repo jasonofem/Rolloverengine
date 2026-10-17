@@ -374,7 +374,12 @@ rather than two that can drift), plain ES module, no loader hooks, no build
 step.
 
 Coverage: 15 football leagues / 284 clubs from the Premier League down to the
-NPFL, 3 basketball leagues, MLB, and ATP/WTA and UFC player fields.
+NPFL, ATP/WTA (match winner and game-line totals), MLB, and UFC player fields.
+
+Basketball is deliberately **not** offered. It was retired from the board after
+repeated rollover losses; the ratings table and gaussian maths remain because
+baseball shares them, but no scan, slip, league chip or label can surface a
+basketball market. Old saved sport-key lists are stripped on load and on save.
 
 ---
 

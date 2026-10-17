@@ -28,7 +28,7 @@ const money = (n, c = cur()) =>
 const money0 = (n, c = cur()) => `${c}${Math.round(Number(n ?? 0)).toLocaleString('en-NG')}`;
 const pct = (n, dp = 1) => `${Number(n ?? 0).toFixed(dp)}%`;
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
-const SPORT_LABEL = { football: 'Football', basketball: 'Basketball', baseball: 'Baseball', tennis: 'Tennis', mma: 'MMA' };
+const SPORT_LABEL = { football: 'Football', tennis: 'Tennis', baseball: 'Baseball', mma: 'MMA' };
 
 /* ------------------------------------------------------------------ *
  * Transport
@@ -87,7 +87,7 @@ async function chooseTransport() {
    * run a seven-day rollover is this tab — a run must never live somewhere
    * that can silently forget it. */
   try {
-    const mod = await import('./local-api.js?v=1.1.5'); // stamped: see index.html
+    const mod = await import('./local-api.js?v=1.1.6'); // stamped: see index.html
     transport = mod.localFetch;
 
     const info = mod.storageInfo();
@@ -1484,8 +1484,10 @@ function renderLive(j) {
     <div class="live-leagues">${leagues}</div>
     ${legs}
     <p class="live-note">These are real bookmaker prices, de-vigged and blended with the same weights the Lab justified.
-    Head-to-head markets only. <b>truthProb and calibration are null on purpose</b> — with live fixtures nobody knows
-    the answer yet, so nothing here can flatter itself. Advisory slip: run tracking still settles against the simulator.</p>
+    Straight wins, totals and handicaps — tennis ATP/WTA is part of the board, with match winners and game-line
+    over/unders priced by the same rollover logic. <b>truthProb and calibration are null on purpose</b> — with live
+    fixtures nobody knows the answer yet, so nothing here can flatter itself. Advisory slip: run tracking still
+    settles against the simulator.</p>
   </div>`;
 }
 

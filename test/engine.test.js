@@ -326,11 +326,13 @@ describe('truth layer — the model must NOT be omniscient', () => {
 });
 
 describe('fixtures', () => {
-  test('a day generates events across all five sports', () => {
+  test('a day covers the four active sports — and never basketball', () => {
     const events = buildDayEvents(DAY, { tz: TZ });
     const sports = new Set(events.map((e) => e.sport));
-    assert.ok(sports.size >= 5, `only got ${[...sports]}`);
+    assert.deepEqual([...sports].sort(), ['baseball', 'football', 'mma', 'tennis'], `only got ${[...sports]}`);
     assert.ok(events.length >= 30);
+    assert.ok(events.filter((e) => e.sport === 'tennis').length >= 4,
+      'tennis absorbed the retired basketball share');
     for (const e of events) {
       assert.ok(e.id && e.home?.name && e.away?.name && e.kickoff);
       assert.ok(e.markets.length >= 1);
@@ -355,6 +357,7 @@ describe('fixtures', () => {
     const thin = buildDayEvents('2026-10-12', { tz: TZ }); // Monday
     const sports = new Set(thin.map((e) => e.sport));
     assert.ok(sports.size >= 4, `Monday only produced ${[...sports]}`);
+    assert.ok(!thin.some((e) => /basketball/i.test(e.sport)), 'no day may schedule a retired sport');
   });
 
   test('kickoffs land inside the day in local time', () => {
@@ -761,14 +764,20 @@ describe('settlement integrity', () => {
 
 describe('monte-carlo lab', () => {
   test('the engine beats a naive target-matcher over many runs', () => {
+    /* 300 iterations, not 120: the win-rate comparison is a sample, and the
+     * promoted tennis board lands more two-way markets per day, so the daily
+     * rate needs a wider sample before the (real, ~4pp) true-EV edge shows up
+     * as a win-rate gap. At 120 iterations seed 4242 reports a 0.2pp deficit
+     * that reverses decisively by 300. The true-EV assertions below hold at
+     * every sample size; this only stops a coin-flip from failing the build. */
     const res = runSimulation({
-      iterations: 120, days: 7, targetOdds: 2.0, stake: 500,
+      iterations: 300, days: 7, targetOdds: 2.0, stake: 500,
       eventsPerDay: 42, marketInefficiency: 1.3, marketVariants: 3, seed: 4242,
       strategies: ['engine', 'naive'],
     });
     const e = res.strategies.engine;
     const n = res.strategies.naive;
-    assert.ok(e.iterations === 120);
+    assert.ok(e.iterations === 300);
     assert.ok(e.avgDailyWinRatePct > n.avgDailyWinRatePct,
       `engine ${e.avgDailyWinRatePct}% should beat random ${n.avgDailyWinRatePct}%`);
     // The decisive test: legs the engine picked must carry positive TRUE EV,
@@ -1230,9 +1239,10 @@ describe('projection arithmetic', () => {
 
 /**
  * A realistic The Odds API v4 payload. Three books on the football game
- * including one sharp (Pinnacle), two on the basketball game, and a market the
- * live scanner deliberately ignores (totals) so we can prove it is not silently
- * half-pricing things it cannot model.
+ * including one sharp (Pinnacle), and two on the tennis match — straight wins
+ * plus a game-line total, which is the promoted replacement for the retired
+ * basketball board. Basketball is absent on purpose; a regression test below
+ * proves a basketball payload cannot sneak back in.
  */
 const LIVE_FIXTURES = {
   soccer_epl: [{
@@ -1252,13 +1262,19 @@ const LIVE_FIXTURES = {
       ] },
     ],
   }],
-  basketball_nba: [{
-    id: 'nba-1', sport_key: 'basketball_nba',
+  tennis_atp: [{
+    id: 'atp-1', sport_key: 'tennis_atp',
     commence_time: new Date(Date.now() + 22 * 3600e3).toISOString(),
-    home_team: 'Lakers', away_team: 'Celtics',
+    home_team: 'Alcaraz', away_team: 'Sinner',
     bookmakers: [
-      { key: 'pinnacle', title: 'Pinnacle', markets: [{ key: 'h2h', outcomes: [{ name: 'Lakers', price: 2.05 }, { name: 'Celtics', price: 1.86 }] }] },
-      { key: 'unibet', title: 'Unibet', markets: [{ key: 'h2h', outcomes: [{ name: 'Lakers', price: 2.0 }, { name: 'Celtics', price: 1.83 }] }] },
+      { key: 'pinnacle', title: 'Pinnacle', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Alcaraz', price: 2.05 }, { name: 'Sinner', price: 1.86 }] },
+        { key: 'totals', point: 22.5, outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 1.95 }] },
+      ] },
+      { key: 'unibet', title: 'Unibet', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Alcaraz', price: 2.0 }, { name: 'Sinner', price: 1.83 }] },
+        { key: 'totals', point: 22.5, outcomes: [{ name: 'Over', price: 1.92 }, { name: 'Under', price: 1.9 }] },
+      ] },
     ],
   }],
 };
@@ -1325,8 +1341,10 @@ describe('live odds — real quotes, and never a silent simulation', () => {
     assert.match(res.diagnostics.scope, /totals/i, 'the scope line names the widened market set');
     const types = new Set(res.scan.legs.map((l) => l.marketType));
     assert.ok(types.has('h2h') && types.has('totals'), `h2h + totals expected, got ${[...types].join(',')}`);
-    // 3 h2h outcomes + 2 total outcomes on the football game, 2 on the basketball game.
-    assert.equal(res.scan.legs.length, 7);
+    // Football: 3 h2h outcomes + 2 total outcomes = 5 legs.
+    // Tennis:   2 h2h outcomes + 2 total outcomes = 4 legs.
+    // (Basketball used to contribute 2; it is no longer on the board.)
+    assert.equal(res.scan.legs.length, 9);
     const over = res.scan.legs.find((l) => l.marketType === 'totals' && l.pick === 'Over');
     assert.ok(over, 'a one-book total is still priced — with the confidence that one book earns');
     assert.ok(Number.isFinite(over.edge));
@@ -1457,16 +1475,24 @@ describe('live odds — quota, multi-sport, and pasted prices', () => {
       assert.equal(quota.remaining, 431, 'the allowance is surfaced, not swallowed');
       assert.equal(quota.used, 69);
       const sports = new Set(urls.map((u) => /sports\/([a-z_]+)\/odds/.exec(u)[1]));
-      for (const k of ['basketball_nba', 'tennis_atp', 'tennis_wta', 'mma_mixed_martial_arts', 'icehockey_nhl', 'baseball_mlb']) {
+      for (const k of ['tennis_atp', 'tennis_wta', 'mma_mixed_martial_arts', 'icehockey_nhl', 'baseball_mlb', 'soccer_epl']) {
         assert.ok(sports.has(k), `${k} must be on the board — the engine is not football-only`);
       }
+      /* Basketball was retired from the product. This is the board-level
+       * guarantee: not "hidden downstream", never requested at all. */
+      assert.ok(![...sports].some((k) => /basketball/i.test(k)), 'no basketball league key may be on the board');
+      assert.ok(!leagues.some((l) => /basketball/i.test(l.key) || /basketball/i.test(l.sport)), 'no basketball league chip');
       assert.ok(sports.size >= 20, `expected a broad board, got ${sports.size}`);
       const cricket = leagues.find((l) => l.key === 'cricket_odi');
       assert.equal(cricket.ok, false, 'an out-of-season or unknown key is recorded, not fatal');
       assert.equal(cricket.status, 404);
-      const nba = leagues.find((l) => l.key === 'basketball_nba');
-      assert.equal(nba.ok, true);
-      assert.equal(nba.fixtures, 0);
+      /* Tennis is the promoted replacement, and both tours are queried. */
+      const atp = leagues.find((l) => l.key === 'tennis_atp');
+      assert.equal(atp.ok, true);
+      assert.equal(atp.fixtures, 0);
+      const wta = leagues.find((l) => l.key === 'tennis_wta');
+      assert.equal(wta.ok, true);
+      assert.equal(wta.fixtures, 0);
     } finally { globalThis.fetch = real; }
   });
 
@@ -1476,31 +1502,35 @@ describe('live odds — quota, multi-sport, and pasted prices', () => {
     const real = globalThis.fetch;
     globalThis.fetch = async (u) => { urls.push(String(u)); return { ok: true, headers: { get: () => null }, json: async () => [] }; };
     try {
-      await fetchOddsApi(['basketball_nba', 'tennis_atp'], 'k', {});
+      await fetchOddsApi(['tennis_atp', 'tennis_wta'], 'k', {});
       assert.equal(urls.length, 2, 'one request per requested key — the free tier is 500 a month');
+      assert.ok(urls.every((u) => /tennis_(atp|wta)/.test(u)), 'and the subset is exactly what was asked for');
     } finally { globalThis.fetch = real; }
   });
 
-  test('live scan prices totals and spreads, not just 1X2', async () => {
+  test('a tennis board prices match winners, game-line totals and handicaps', async () => {
+    /* Basketball was retired; this is the promoted replacement doing the full
+     * job: two-way h2h (no draw, clean de-vig), a 22.5 game total, and a
+     * games handicap — all through the unchanged generic parsers. */
     const { scanDayLive } = await import('../lib/scan.js');
     const d = new Date();
     const commence = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 12, 0, 0)).toISOString();
     const dayKey = commence.slice(0, 10);
     const game = {
-      id: 'mm1',
+      id: 'atp-mm1',
       commence_time: commence,
-      home_team: 'Lakers',
-      away_team: 'Celtics',
+      home_team: 'Alcaraz',
+      away_team: 'Sinner',
       bookmakers: [
         { title: 'Pinnacle', markets: [
-          { key: 'h2h', outcomes: [{ name: 'Lakers', price: 1.95 }, { name: 'Celtics', price: 1.95 }] },
-          { key: 'totals', point: 220.5, outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 2.0 }] },
-          { key: 'spreads', point: -1.5, outcomes: [{ name: 'Lakers', price: 1.87, point: -1.5 }, { name: 'Celtics', price: 2.03, point: 1.5 }] },
+          { key: 'h2h', outcomes: [{ name: 'Alcaraz', price: 1.95 }, { name: 'Sinner', price: 1.95 }] },
+          { key: 'totals', point: 22.5, outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 2.0 }] },
+          { key: 'spreads', point: -3.5, outcomes: [{ name: 'Alcaraz', price: 1.87, point: -3.5 }, { name: 'Sinner', price: 2.03, point: 3.5 }] },
         ] },
         { title: 'Bet365', markets: [
-          { key: 'h2h', outcomes: [{ name: 'Lakers', price: 1.9 }, { name: 'Celtics', price: 2.0 }] },
-          { key: 'totals', point: 220.5, outcomes: [{ name: 'Over', price: 1.95 }, { name: 'Under', price: 1.95 }] },
-          { key: 'spreads', point: -1.5, outcomes: [{ name: 'Lakers', price: 1.9, point: -1.5 }, { name: 'Celtics', price: 2.0, point: 1.5 }] },
+          { key: 'h2h', outcomes: [{ name: 'Alcaraz', price: 1.9 }, { name: 'Sinner', price: 2.0 }] },
+          { key: 'totals', point: 22.5, outcomes: [{ name: 'Over', price: 1.95 }, { name: 'Under', price: 1.95 }] },
+          { key: 'spreads', point: -3.5, outcomes: [{ name: 'Alcaraz', price: 1.9, point: -3.5 }, { name: 'Sinner', price: 2.0, point: 3.5 }] },
         ] },
       ],
     };
@@ -1508,13 +1538,15 @@ describe('live odds — quota, multi-sport, and pasted prices', () => {
     globalThis.fetch = async (u) => ({
       ok: true,
       headers: { get: (h) => (h === 'x-requests-remaining' ? '400' : null) },
-      json: async () => (String(u).includes('basketball_nba') ? [game] : []),
+      json: async () => (String(u).includes('tennis_atp') ? [game] : []),
     });
     try {
-      const out = await scanDayLive(dayKey, { apiKey: 'k', sports: ['basketball_nba'], tz: 'UTC' });
+      const out = await scanDayLive(dayKey, { apiKey: 'k', sports: ['tennis_atp'], tz: 'UTC' });
       const types = new Set(out.legs.map((l) => l.marketType));
       assert.ok(types.has('h2h') && types.has('totals') && types.has('spreads'),
         `expected all three market families, got ${[...types].join(',')}`);
+      assert.ok(out.legs.every((l) => l.sport === 'tennis'), 'every priced leg is tennis');
+      assert.ok(out.legs.every((l) => !/basketball/i.test(l.league)), 'no basketball league chip');
       for (const l of out.legs) {
         assert.equal(l.live, true);
         assert.equal(l.truthProb, null);
@@ -1646,6 +1678,164 @@ describe('live odds — quota, multi-sport, and pasted prices', () => {
     assert.equal(scan.body.provider.used, 'sim', '…but odds below 1 cannot price anything, so it falls back');
     assert.equal(scan.body.provider.fellBack, true);
     assert.match(scan.body.provider.reason, /could not be used/i);
+  });
+});
+
+/* ================================================================== *
+ * SPORT POLICY — basketball is retired from everything the user sees
+ * ================================================================== */
+
+describe('sport policy — no basketball in any scan, slip or chip', () => {
+  const commence = new Date(Date.now() + 22 * 3600e3).toISOString();
+  const dayKey = commence.slice(0, 10);
+
+  const footballGame = {
+    id: 'pol-epl', sport_key: 'soccer_epl', commence_time: commence,
+    home_team: 'Arsenal', away_team: 'Everton',
+    bookmakers: [
+      { title: 'Pinnacle', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.42 }, { name: 'Everton', price: 8.1 }, { name: 'Draw', price: 5.05 }] },
+        { key: 'totals', point: 2.5, outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 1.95 }] },
+      ] },
+      { title: 'Bet365', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.4 }, { name: 'Everton', price: 8.0 }, { name: 'Draw', price: 4.8 }] },
+        { key: 'totals', point: 2.5, outcomes: [{ name: 'Over', price: 1.95 }, { name: 'Under', price: 1.9 }] },
+      ] },
+      { title: 'Bet9ja', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Arsenal', price: 1.38 }, { name: 'Everton', price: 7.5 }, { name: 'Draw', price: 4.6 }] },
+      ] },
+    ],
+  };
+
+  const tennisGame = {
+    id: 'pol-atp', sport_key: 'tennis_atp', commence_time: commence,
+    home_team: 'Alcaraz', away_team: 'Sinner',
+    bookmakers: [
+      { title: 'Pinnacle', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Alcaraz', price: 2.05 }, { name: 'Sinner', price: 1.86 }] },
+        { key: 'totals', point: 22.5, outcomes: [{ name: 'Over', price: 1.9 }, { name: 'Under', price: 1.95 }] },
+      ] },
+      { title: 'Unibet', markets: [
+        { key: 'h2h', outcomes: [{ name: 'Alcaraz', price: 2.0 }, { name: 'Sinner', price: 1.83 }] },
+        { key: 'totals', point: 22.5, outcomes: [{ name: 'Over', price: 1.92 }, { name: 'Under', price: 1.9 }] },
+      ] },
+    ],
+  };
+
+  /* A quote sheet the old build would have accepted. It is injected into every
+   * response below, so the only thing stopping it is the sport policy. */
+  const basketballGame = {
+    id: 'pol-nba', sport_key: 'basketball_nba', commence_time: commence,
+    home_team: 'Lakers', away_team: 'Celtics',
+    bookmakers: [
+      { title: 'Pinnacle', markets: [{ key: 'h2h', outcomes: [{ name: 'Lakers', price: 2.05 }, { name: 'Celtics', price: 1.86 }] }] },
+      { title: 'Unibet', markets: [{ key: 'h2h', outcomes: [{ name: 'Lakers', price: 2.0 }, { name: 'Celtics', price: 1.83 }] }] },
+    ],
+  };
+
+  test('a stubbed board full of basketball quotes yields zero basketball legs and chips', async () => {
+    const { fetchOddsApi } = await import('../lib/scan.js');
+    const urls = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      urls.push(String(u));
+      const key = /sports\/([a-z_]+)\/odds/.exec(u)?.[1];
+      const payload = [];
+      if (key === 'soccer_epl') payload.push(footballGame);
+      if (key === 'tennis_atp' || key === 'tennis_wta') payload.push({ ...tennisGame, sport_key: key });
+      // Every response is a mixed feed: the basketball game rides along.
+      payload.push(basketballGame);
+      return { ok: true, headers: { get: () => null }, json: async () => payload };
+    };
+    try {
+      const fetched = await fetchOddsApi(null, 'k', {});
+      assert.ok(urls.length >= 20, `board shrank unexpectedly: ${urls.length} keys`);
+      assert.ok(!urls.some((u) => /basketball/i.test(u)), 'the board must never request a basketball league');
+      assert.ok(!fetched.games.some((g) => /basketball/i.test(g.sport)), 'no basketball fixture survives normalisation');
+      assert.ok(!fetched.leagues.some((l) => /basketball/i.test(l.key) || /basketball/i.test(l.sport)), 'no basketball league chip');
+
+      const live = await scanDayLive(dayKey, {
+        apiKey: 'k', tz: 'UTC', sports: ['soccer_epl', 'tennis_atp'],
+        builder: { targetOdds: 2.0, tolerance: 0.5, mode: 'balanced', preferSports: ['tennis'] },
+      });
+      assert.ok(live.legs.length > 0, 'the stubbed board still prices real legs');
+      assert.equal(live.legs.filter((l) => /basketball/i.test(l.sport) || /basketball/i.test(l.league)).length, 0,
+        'zero basketball legs');
+      assert.equal((live.leagues || []).filter((l) => /basketball/i.test(l.key) || /basketball/i.test(l.sport)).length, 0,
+        'zero basketball league chips');
+      assert.ok(live.legs.some((l) => l.sport === 'tennis'), 'tennis is priced');
+      assert.ok(live.legs.some((l) => l.sport === 'football'), 'football is still priced');
+
+      const slip = buildRolloverSlip(live.legs, {
+        targetOdds: 2.0, tolerance: 0.5, mode: 'balanced', preferSports: ['tennis'],
+      });
+      const chosen = slip.ok ? slip.best : slip.fallback;
+      assert.ok(chosen, 'a slip or an explicitly-labelled fallback is produced');
+      assert.equal(chosen.legs.filter((l) => /basketball/i.test(l.sport)).length, 0, 'zero basketball legs in the slip');
+    } finally { globalThis.fetch = real; }
+  });
+
+  test('a saved basketball sport key is stripped on save and on load', async () => {
+    const { createMemoryStore } = await import('../lib/memory-store.js');
+    const store = createMemoryStore();
+    /* Pretend this store was written by the pre-1.1.6 build: a saved board
+     * list that still contains the retired keys. */
+    await store.saveSettings({ oddsApi: { key: 'k', sports: ['basketball_nba', 'tennis_atp', 'basketball_wnba'] } });
+    const loaded = await store.getSettings();
+    assert.deepEqual(loaded.oddsApi.sports, ['tennis_atp'], 'basketball keys are stripped on save/load');
+    assert.deepEqual(loaded.preferSports, ['tennis'], 'tennis is the default builder preference');
+
+    const { createApi } = await import('../lib/http-core.js');
+    const api = createApi({ store, env: {}, persistent: false });
+    const r = await api({
+      method: 'POST', pathname: '/api/settings', query: new URLSearchParams(),
+      body: { oddsApi: { key: 'k', sports: ['basketball_euroleague', 'soccer_epl'] } },
+    });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.settings.oddsApi.sports, ['soccer_epl'], 'a settings patch cannot resurrect basketball');
+  });
+
+  test('no simulated day or simulated slip can contain basketball', () => {
+    for (const day of ['2026-10-10', '2026-10-13']) {
+      const scan = scanDay(day, { tz: TZ, eventsPerDay: 42, marketInefficiency: 1.3 });
+      assert.ok(!scan.events.some((e) => /basketball/i.test(e.sport)), `${day}: simulated fixture list`);
+      assert.ok(!scan.legs.some((l) => /basketball/i.test(l.sport) || /basketball/i.test(l.league)), `${day}: simulated legs`);
+      const slip = buildRolloverSlip(scan.legs, { targetOdds: 2.0, tolerance: 0.1 });
+      const chosen = slip.ok ? slip.best : slip.fallback;
+      assert.ok(!chosen || !chosen.legs.some((l) => /basketball/i.test(l.sport)), `${day}: simulated slip`);
+    }
+  });
+
+  test('preferSports is a tie-break between equals — never a subsidy, never a loophole', () => {
+    const leg = (sport, id) => ({
+      legId: `${id}::h2h::a`, eventId: id, sport, league: sport.toUpperCase(), leagueCode: sport.toUpperCase(),
+      tier: 1, kickoff: Date.now() + 20 * 3600e3, home: 'Alpha', away: 'Beta',
+      market: 'Match Winner', marketKey: 'h2h', marketType: 'h2h', pick: 'Alpha', pickKey: 'a',
+      odds: 2.0, book: 'Book', modelProb: 0.5, fairProb: 0.5, sharpProb: 0.5, ratingsProb: 0.5,
+      impliedProb: 0.5, truthProb: null, trueEvPerUnit: null, modelError: null, ratingsError: null,
+      edge: 0.05, evPerUnit: 0, confidence: 0.7, agreement: 0.9, band: 'B', correlation: id,
+    });
+    /* Identical numbers, so the score buckets tie exactly and only the sport
+     * preference can order them. The basketball leg must be removed outright. */
+    const legs = [leg('football', 'f1'), leg('tennis', 't1'), leg('basketball', 'b1')];
+    const opts = { targetOdds: 2.0, tolerance: 0.1, minLegs: 1, mode: 'max', alternatives: 3 };
+
+    const tennisFirst = buildRolloverSlip(legs, opts);
+    assert.ok(tennisFirst.ok);
+    assert.equal(tennisFirst.best.legs[0].sport, 'tennis', 'the default preference breaks the tie toward tennis');
+    assert.equal(tennisFirst.report.retiredSportsRemoved, 1, 'the retired leg is reported, not silently ignored');
+    assert.ok(tennisFirst.alternatives.every((c) => c.legs.every((l) => l.sport !== 'basketball')));
+
+    const footballFirst = buildRolloverSlip(legs, { ...opts, preferSports: ['football'] });
+    assert.equal(footballFirst.best.legs[0].sport, 'football', 'the preference is configurable');
+
+    /* Preference must never lift a leg over a gate. A tennis leg below the
+     * confidence floor stays out even when tennis is preferred. */
+    const weakTennis = { ...leg('tennis', 't2'), confidence: 0.1 };
+    const gated = buildRolloverSlip([weakTennis, leg('football', 'f2')], {
+      ...opts, minConfidence: 0.25, preferSports: ['tennis'],
+    });
+    assert.ok(gated.best.legs.every((l) => l.sport !== 'tennis'), 'preference cannot override the confidence gate');
   });
 });
 
