@@ -1422,9 +1422,14 @@ const RATINGS = __exp_17;
  * Given a date, it produces a deterministic set of fixtures spread across
  * every sport in the ratings database. "Sports versatility" in the engine
  * means: the slip is never forced to be five Premier League results. It can
- * be an EPL double-chance + an NBA point line + a Serie A under 2.5 + a
- * tennis moneyline — as long as each leg carries edge and the product lands
+ * be an ATP match winner + an EPL double-chance + an MLB moneyline + a
+ * Serie A under 2.5 — as long as each leg carries edge and the product lands
  * on the day's odds target.
+ *
+ * Basketball was retired from the product after repeated rollover losses. The
+ * ratings table and gaussian model stay (baseball shares the maths), but the
+ * mix below can never schedule a basketball event, so no simulated day — gold
+ * SIMULATED banner and all — can put one on a slip.
  *
  * Everything is seeded off the date string, so re-scanning the same day
  * returns the same universe (idempotent) until you settle it.
@@ -1435,11 +1440,12 @@ const RATINGS = __exp_17;
 
 /** How the day's event budget is split across sports. */
 const SPORT_MIX = {
-  football: 0.6,
-  basketball: 0.15,
-  baseball: 0.09,
-  tennis: 0.11,
-  mma: 0.05,
+  football: 0.55,
+  /* The old basketball share is absorbed here: tennis is the promoted
+   * replacement for straight wins and totals. Sums to 1 by construction. */
+  tennis: 0.25,
+  baseball: 0.1,
+  mma: 0.1,
 };
 
 
@@ -1539,7 +1545,7 @@ function planDay(dayKey, opts = {}) {
   // Largest-remainder apportionment: keeps every sport represented even on a
   // thin Monday, instead of rounding the small sports down to nothing.
   const sports = Object.keys(SPORT_MIX);
-  const mins = { football: 6, basketball: 2, baseball: 1, tennis: 1, mma: 1 };
+  const mins = { football: 6, baseball: 1, tennis: 1, mma: 1 };
   const raw = sports.map((sp) => total * SPORT_MIX[sp]);
   const floor = raw.map((v, i) => Math.max(mins[sports[i]] ?? 1, Math.floor(v)));
   let left = total - floor.reduce((a, b) => a + b, 0);
@@ -1619,7 +1625,7 @@ function buildDayEvents(dayKey, opts = {}) {
 
   for (const p of plan) {
     const rng = makeRng(`fx|${dayKey}|${p.league.code}|${p.count}`);
-    if (p.sport === 'football' || p.sport === 'basketball' || p.sport === 'baseball') {
+    if (p.sport === 'football' || p.sport === 'baseball') {
       const teams = rng.shuffle(p.league.teams);
       const pairCount = Math.min(p.count, Math.floor(teams.length / 2));
       for (let i = 0; i < pairCount; i++) {
@@ -2493,15 +2499,184 @@ __exp_32 = SIGNAL_WEIGHTS;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   lib/builder.js   →  hoists buildRolloverSlip, DEFAULT_BUILDER_OPTS
+   lib/store-shared.js   →  hoists isRetiredSport, normalisePreferSports, DEFAULT_SETTINGS, summariseRun, reviveRun, sanitiseSettings, sanitiseSettingsPatch
    ════════════════════════════════════════════════════════════════════════ */
 let __exp_33;
 let __exp_34;
+let __exp_35;
+let __exp_36;
+let __exp_37;
+let __exp_38;
+let __exp_39;
+{
+/**
+ * store-shared.js — the parts of persistence that every backend must agree on.
+ *
+ * Three storage backends implement the same contract: the flat JSON file
+ * (lib/store.js), an in-process object for serverless (lib/memory-store.js) and
+ * localStorage in the browser (also lib/memory-store.js). If any of them
+ * disagrees about what a run summary looks like or what the default settings
+ * are, the same dashboard renders different numbers depending on where it is
+ * hosted — which is exactly the kind of quiet inconsistency that makes you
+ * distrust a system that is entirely about trustworthy numbers.
+ *
+ * So the shared definitions live here, in a module with no imports at all. That
+ * last part matters: the browser build must be able to bundle this without
+ * dragging node:fs in behind it.
+ */
+
+/**
+ * Sports this build refuses to price, league-key prefixes included.
+ *
+ * Basketball was retired as a product decision after repeated rollover losses:
+ * the user does not want it on the board, in a slip, or in a league chip ever
+ * again. This is a risk policy, not a modelling claim — the gaussian margin
+ * maths in model.js stays because baseball still uses it. The policy lives here
+ * (in the module with no imports) so every backend, the browser bundle, the
+ * scanner and the builder all enforce the same list.
+ */
+const RETIRED_SPORTS = ['basketball'];
+
+/** True for `basketball`, `basketball_nba`, `basketball-euroleague`, … */
+function isRetiredSport(value) {
+  const s = String(value ?? '').trim().toLowerCase();
+  if (!s) return false;
+  return RETIRED_SPORTS.some(
+    (r) => s === r || s.startsWith(`${r}_`) || s.startsWith(`${r}-`) || s.startsWith(`${r} `)
+  );
+}
+
+/** Preferred sports are a tie-break in the builder, never a subsidy. */
+const DEFAULT_PREFER_SPORTS = ['tennis'];
+
+/** Normalise a `preferSports` value from settings, a run config or a caller. */
+function normalisePreferSports(value) {
+  const list = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : DEFAULT_PREFER_SPORTS;
+  const cleaned = list
+    .map((s) => String(s).trim().toLowerCase())
+    .filter((s) => s && !isRetiredSport(s));
+  return [...new Set(cleaned)];
+}
+
+/**
+ * Drop retired sport keys from a settings patch before it is persisted.
+ *
+ * A user's saved `settings.oddsApi.sports` may still contain `basketball_*`
+ * from before this change. Silently stripping them here — on the way in AND on
+ * the way out (see `sanitiseSettings`) — is what stops old localStorage or
+ * Vercel state from resurrecting a board entry the product no longer offers.
+ * Silent on purpose: the user never asked to manage a key list, and an error
+ * about a sport they asked us to remove would be noise, not honesty.
+ */
+function sanitiseSettingsPatch(patch) {
+  if (!patch || typeof patch !== 'object') return patch;
+  return sanitiseSettings(patch);
+}
+
+/** Strip retired sport keys and normalise preferences on a full settings object. */
+function sanitiseSettings(settings) {
+  if (!settings || typeof settings !== 'object') return settings;
+  const out = { ...settings };
+  if (out.oddsApi && typeof out.oddsApi === 'object') {
+    const sports = Array.isArray(out.oddsApi.sports)
+      ? out.oddsApi.sports.filter((k) => !isRetiredSport(k))
+      : [];
+    out.oddsApi = { ...out.oddsApi, sports };
+  }
+  if (out.preferSports !== undefined) {
+    out.preferSports = normalisePreferSports(out.preferSports);
+  }
+  return out;
+}
+
+/** House defaults. Nigerian Naira, ₦500, 7 days at 2.00, Africa/Lagos. */
+const DEFAULT_SETTINGS = {
+  currency: 'NGN',
+  tz: 'Africa/Lagos',
+  stake: 500,
+  days: 7,
+  targetOdds: 2.0,
+  tolerance: 0.1,
+  mode: 'balanced',
+  provider: 'sim',
+  eventsPerDay: 42,
+  marketInefficiency: 1.3,
+  reservePct: 0,
+  /* The edge floor defaults to 0 on purpose. Positive-edge legs are
+   * disproportionately longshots, so gating the *search* on an edge floor
+   * starves the pool of the short prices needed to build a 2.00 accumulator and
+   * the day silently degrades into one long leg. The win-probability optimiser
+   * lands on +edge legs anyway (around +1.5pp per leg unprompted); the floor is
+   * a reporting number, and the builder relaxes it in tiers when it bites. */
+  minEdgePerLeg: 0,
+  maxLegs: 6,
+  /* Tennis is the promoted replacement for the retired basketball board. The
+   * builder only reads this as a tie-break between combinations it already
+   * considers equal on score — it can never lift a leg over the edge floor, the
+   * odds band or a confidence gate. */
+  preferSports: [...DEFAULT_PREFER_SPORTS],
+  /* Real prices you pasted yourself (SportyBet screenshot transcription, a
+   * telegram tip with numbers, whatever). Empty means "nothing pasted", which
+   * the scan reports as a fallback rather than pretending to use them. */
+  manualOdds: [],
+};
+
+/** What the run list shows. Cheap enough to compute on every read. */
+function summariseRun(r) {
+  const cfg = r.config || {};
+  return {
+    id: r.id,
+    status: r.status,
+    createdAt: r.createdAt,
+    currency: cfg.currency,
+    stake: r.startBalance,
+    balance: r.balance,
+    days: cfg.days,
+    currentDay: r.currentDay,
+    targetOdds: cfg.targetOdds,
+    daysWon: r.stats?.won ?? 0,
+    profit: Math.round((r.balance - r.startBalance) * 100) / 100,
+    headline: r.verdict?.headline ?? null,
+    provider: cfg.provider,
+    startedOn: cfg.startDay,
+  };
+}
+
+/** Runs are persisted as plain JSON, so rehydrate what the engine expects live. */
+function reviveRun(run) {
+  if (!run) return run;
+  for (const d of run.days || []) {
+    if (d.result?.resolved) {
+      for (const r of d.result.resolved) if (r.wonSet) delete r.wonSet;
+    }
+  }
+  return run;
+}
+__exp_33 = isRetiredSport;
+__exp_34 = normalisePreferSports;
+__exp_35 = DEFAULT_SETTINGS;
+__exp_36 = summariseRun;
+__exp_37 = reviveRun;
+__exp_38 = sanitiseSettings;
+__exp_39 = sanitiseSettingsPatch;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   lib/builder.js   →  hoists buildRolloverSlip, DEFAULT_BUILDER_OPTS
+   ════════════════════════════════════════════════════════════════════════ */
+let __exp_40;
+let __exp_41;
 {
 const clamp = __exp_6;
 const round = __exp_7;
 const mean = __exp_10;
 const correlationFactor = __exp_27;
+const isRetiredSport = __exp_33;
+const normalisePreferSports = __exp_34;
 
 /**
  * builder.js — the rollover slip optimiser.
@@ -2535,6 +2710,7 @@ const correlationFactor = __exp_27;
 
 
 
+
 const DEFAULT_BUILDER_OPTS = {
   targetOdds: 2.0,
   tolerance: 0.1, // ± band around the target
@@ -2557,6 +2733,15 @@ const DEFAULT_BUILDER_OPTS = {
    * combo    → insists on maxLegs-style multi-game slips. Fun, lower hit rate.
    */
   mode: 'balanced',
+  /**
+   * A nudge between equals, never a subsidy. When two combinations land in the
+   * same score bucket (and therefore the same edge tier and confidence band),
+   * the one carrying more legs from these sports is listed first. It is applied
+   * AFTER the odds band, the confidence floor and the edge tier, so it can
+   * never lift a leg the gates rejected. Tennis is the default because it is
+   * the promoted replacement for the retired basketball board.
+   */
+  preferSports: ['tennis'],
 };
 
 /**
@@ -2570,17 +2755,28 @@ function buildRolloverSlip(legs, opts = {}) {
   const target = Number(o.targetOdds);
   const lo = target - o.tolerance;
   const hi = target + o.tolerance;
+  const prefer = new Set(normalisePreferSports(o.preferSports));
+
+  /* Sport policy, enforced at the last gate as well as at the board.
+   * Basketball was retired from the product, so no path — a cached board, an
+   * old persisted run being rescanned, or a caller passing legs directly — can
+   * put one in a slip. The scan layer already refuses to fetch it; this is the
+   * belt to that braces. */
+  const sanctioned = legs.filter((l) => !isRetiredSport(l.sport));
+  const retired = legs.length - sanctioned.length;
 
   const report = {
     target,
     lo: round(lo, 3),
     hi: round(hi, 3),
     scanned: legs.length,
-    events: new Set(legs.map((l) => l.eventId)).size,
+    retiredSportsRemoved: retired,
+    events: new Set(sanctioned.map((l) => l.eventId)).size,
     eligible: 0,
     positiveEdge: 0,
     rejected: { edge: 0, confidence: 0, odds: 0 },
     bestOddsSpan: [0, 0],
+    preferSports: [...prefer],
   };
 
   // ---- eligibility filter -------------------------------------------
@@ -2597,7 +2793,7 @@ function buildRolloverSlip(legs, opts = {}) {
    * The win-probability optimiser already prefers +EV legs on its own.
    */
   const pool = [];
-  for (const l of legs) {
+  for (const l of sanctioned) {
     /* A pasted single-book leg can never earn cross-book confidence — one book
      * has no agreement to measure. Its confidence is a flat tier label instead,
      * so the cross-book floor must not be the thing that silently deletes the
@@ -2623,7 +2819,7 @@ function buildRolloverSlip(legs, opts = {}) {
         "Nothing in today's market was quotable — no leg cleared the confidence floor. The engine would rather skip a day than roll a coin flip: skipping costs you a day, a bad slip costs you the run.",
       report,
       alternatives: [],
-      fallback: buildFallback(legs, o),
+      fallback: buildFallback(sanctioned, o),
     };
   }
 
@@ -2733,12 +2929,12 @@ function buildRolloverSlip(legs, opts = {}) {
       message: `The engine found ${report.eligible} legs with edge but could not assemble a combination inside ${lo.toFixed(2)}–${hi.toFixed(2)}. Widen the tolerance or drop the edge floor — or sit this day out.`,
       report,
       alternatives: [],
-      fallback: buildFallback(legs, o),
+      fallback: buildFallback(sanctioned, o),
     };
   }
 
   // ---- rank, apply the edge floor, then the leg-count preference -----
-  found.sort((a, b) => b.score - a.score || b.winProb - a.winProb);
+  found.sort(preferenceOrder(prefer));
   const unconstrainedBest = found[0];
 
   /* Tiered edge relaxation. We would rather show you a slightly-below-floor
@@ -2763,8 +2959,8 @@ function buildRolloverSlip(legs, opts = {}) {
   report.edgeTier = tierUsed.label;
   report.combosAtFloor = o.minEdgePerLeg > -Infinity ? found.filter((x) => x.avgEdge >= o.minEdgePerLeg).length : found.length;
 
-  const { pool: ranked, note } = selectByMode(chosen, o.mode);
-  const diversified = diversify(ranked, o.alternatives);
+  const { pool: ranked, note } = selectByMode(chosen, o.mode, prefer);
+  const diversified = diversify(ranked, o.alternatives, prefer);
   const best = diversified[0];
   best.unconstrained = {
     legCount: unconstrainedBest.legCount,
@@ -2831,16 +3027,17 @@ function gradeCombo(winProb, corr, conf, edge) {
   return g >= 78 ? 'A+' : g >= 68 ? 'A' : g >= 56 ? 'B' : g >= 44 ? 'C' : 'D';
 }
 
-function selectByMode(found, mode) {
+function selectByMode(found, mode, prefer = new Set()) {
   if (mode === 'max' || !found.length) return { pool: found, note: 'Highest win probability, leg count unconstrained.' };
   const maxProbCost = mode === 'combo' ? 14 : 6.5;
   const targetLegs = mode === 'combo' ? 4 : 3;
   const best = found[0];
+  const cmp = preferenceOrder(prefer);
 
   for (let want = targetLegs; want >= 2; want--) {
     const cands = found.filter((c) => c.legCount >= want && (best.winProbPct - c.winProbPct) <= maxProbCost);
     if (cands.length) {
-      const pick = cands.sort((a, b) => b.legCount - a.legCount || b.score - a.score);
+      const pick = cands.sort((a, b) => b.legCount - a.legCount || cmp(a, b));
       const note =
         want >= targetLegs
           ? `Accumulator mode: kept ${want}+ legs while giving up at most ${maxProbCost} points of win probability.`
@@ -2867,7 +3064,7 @@ function stripLeg(l) {
 }
 
 /** Keep the best combo per distinct "shape" so the user gets real choices. */
-function diversify(found, n) {
+function diversify(found, n, prefer = new Set()) {
   const out = [];
   const seen = new Set();
   for (const c of found) {
@@ -2889,7 +3086,37 @@ function diversify(found, n) {
       if (out.length >= n) break;
     }
   }
-  return out.sort((a, b) => b.score - a.score);
+  return out.sort(preferenceOrder(prefer));
+}
+
+/**
+ * Ordering used for slip selection: score first, with the sport preference
+ * acting only as a tie-break inside the same 0.1-point score bucket.
+ *
+ * 0.1 score points is well under a percentage point of win probability here, so
+ * anything separated by more than that keeps its rightful order. The bucket is
+ * also what makes this a proper total order — comparing with a tolerance
+ * directly in a sort comparator is not transitive and can reorder randomly.
+ */
+function preferenceOrder(prefer) {
+  return (a, b) => {
+    const bucketA = Math.round(a.score * 10);
+    const bucketB = Math.round(b.score * 10);
+    if (bucketA !== bucketB) return bucketB - bucketA;
+    const pa = preferredLegs(a, prefer);
+    const pb = preferredLegs(b, prefer);
+    if (pa !== pb) return pb - pa;
+    if (b.score !== a.score) return b.score - a.score;
+    return b.winProb - a.winProb;
+  };
+}
+
+/** How many legs of a combo come from a preferred sport. */
+function preferredLegs(combo, prefer) {
+  if (!prefer.size) return 0;
+  let n = 0;
+  for (const l of combo.legs) if (prefer.has(String(l.sport || '').toLowerCase())) n += 1;
+  return n;
 }
 
 /** One leg per (event, marketType); prefer the higher-edge version. */
@@ -2983,18 +3210,18 @@ function suggestSwap(combo, legIndex, allLegs, opts = {}) {
     newWinProb: c.winProb,
   }));
 }
-__exp_33 = buildRolloverSlip;
-__exp_34 = DEFAULT_BUILDER_OPTS;
+__exp_40 = buildRolloverSlip;
+__exp_41 = DEFAULT_BUILDER_OPTS;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/scan.js   →  hoists scanForDay, scanDay, scanDayLive, PROVIDERS, fetchOddsApi
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_35;
-let __exp_36;
-let __exp_37;
-let __exp_38;
-let __exp_39;
+let __exp_42;
+let __exp_43;
+let __exp_44;
+let __exp_45;
+let __exp_46;
 {
 const buildDayEvents = __exp_18;
 const tzDateKey = __exp_19;
@@ -3005,11 +3232,12 @@ const priceEventFromOffers = __exp_29;
 const extractLegs = __exp_30;
 const classifyBook = __exp_31;
 const applyMarketInformation = __exp_26;
-const buildRolloverSlip = __exp_33;
-const DEFAULT_BUILDER_OPTS = __exp_34;
+const buildRolloverSlip = __exp_40;
+const DEFAULT_BUILDER_OPTS = __exp_41;
 const makeRng = __exp_8;
 const clamp = __exp_6;
 const round = __exp_7;
+const isRetiredSport = __exp_33;
 
 /**
  * scan.js — the market scanner.
@@ -3025,6 +3253,7 @@ const round = __exp_7;
  *   oddsapi — The Odds API (https://the-odds-api.com). Set ODDS_API_KEY and
  *             it will pull live prices instead of simulated ones.
  */
+
 
 
 
@@ -3066,11 +3295,14 @@ const DAY_CACHE_LIMIT = 24;
 function scanDay(dayKey, opts = {}) {
   const requested = opts.provider || 'sim';
   if (requested === 'manual') {
-    const usable = (opts.manualOdds || []).filter(
+    const parsed = (opts.manualOdds || []).filter(
       (e) => e?.outcomes?.length >= 2 && e.outcomes.every((o) => Number(o.odds) > 1));
+    const usable = parsed.filter((e) => !isRetiredSport(e.sport) && !isRetiredSport(e.league));
     if (opts.manualOdds?.length && !usable.length) {
-      return stamp(scanSim(dayKey, opts), requested, 'sim',
-        'Your pasted odds could not be used — every market needs at least two outcomes priced above 1.00. These prices are simulated.');
+      const reason = parsed.length
+        ? 'Your pasted board only contained markets the engine no longer offers (basketball was retired), so these prices are simulated.'
+        : 'Your pasted odds could not be used — every market needs at least two outcomes priced above 1.00. These prices are simulated.';
+      return stamp(scanSim(dayKey, opts), requested, 'sim', reason);
     }
     if (usable.length) return stamp(scanManual(dayKey, { ...opts, manualOdds: usable }), requested, 'manual', null);
     /* You cannot silently answer a request for real prices with invented ones.
@@ -3267,6 +3499,10 @@ function scanLiveGames(dayKey, games, opts = {}) {
   let skippedNoFixture = 0;
 
   for (const g of games) {
+    /* The board no longer queries basketball, but a persisted board handed back
+     * by an older client — or a future API key added by mistake — must not be
+     * able to put a retired sport on a live slip. */
+    if (isRetiredSport(g.sport) || isRetiredSport(g.sport_key)) continue;
     if (!g.kickoff || !Number.isFinite(g.kickoff)) continue;
     if (tzDateKey(new Date(g.kickoff), tz) !== dayKey) { skippedNoFixture += 1; continue; }
 
@@ -3431,6 +3667,9 @@ function scanManual(dayKey, opts = {}) {
   const legs = [];
   const pricedEvents = [];
   for (const [i, entry] of enumerate(entries)) {
+    /* Pasted prices are still subject to the product's sport policy. A line
+     * describing a basketball game is skipped, not quietly repriced. */
+    if (isRetiredSport(entry.sport) || isRetiredSport(entry.league)) continue;
     const oddsList = entry.outcomes.map((o) => Number(o.odds));
     const impl = oddsList.map((o) => 1 / o);
     const sum = impl.reduce((a, b) => a + b, 0);
@@ -3543,7 +3782,7 @@ function scanForDay(dayKey, runConfig, overrides = {}) {
  * The engine is not a football model that tolerates other sports — it is a
  * pricing model, and de-vigging plus sharp-weighting works on any market where
  * several books disagree. Football carries the most ratings priors, but a
- * two-book NBA line de-vigs exactly like a two-book Eredivisie line.
+ * two-book ATP line de-vigs exactly like a two-book Eredivisie line.
  *
  * Keys the API does not recognise (or that are out of season) return an error
  * and are skipped with a recorded reason, so a broad list costs at most one
@@ -3565,11 +3804,11 @@ const SPORT_MAP = [
   { key: 'soccer_netherlands_eredivisie', sport: 'football', league: 'Eredivisie', tier: 2, noise: 0.06, base: 1.5 },
   { key: 'soccer_turkey_super_lig', sport: 'football', league: 'Süper Lig', tier: 2, noise: 0.07, base: 1.4 },
   { key: 'soccer_usa_mls', sport: 'football', league: 'MLS', tier: 2, noise: 0.07, base: 1.5 },
-  // basketball — two-way markets, no draw, tightest lines in betting
-  { key: 'basketball_nba', sport: 'basketball', league: 'NBA', tier: 1, noise: 0.045, base: 114, sigma: 11.6 },
-  { key: 'basketball_euroleague', sport: 'basketball', league: 'EuroLeague', tier: 2, noise: 0.06, base: 84, sigma: 10 },
-  { key: 'basketball_wnba', sport: 'basketball', league: 'WNBA', tier: 2, noise: 0.07, base: 82, sigma: 11 },
-  // tennis — player form moves these more than any team sport
+  /* tennis — player form moves these more than any team sport, and it is the
+   * promoted replacement for the retired basketball board. h2h is two-way
+   * (no draw), so de-vig is clean; game-line totals arrive as ordinary
+   * `totals` markets and are priced by the generic parser below. ATP first:
+   * it is the deeper, sharper card. */
   { key: 'tennis_atp', sport: 'tennis', league: 'ATP', tier: 1, noise: 0.055, scale: 7.5 },
   { key: 'tennis_wta', sport: 'tennis', league: 'WTA', tier: 2, noise: 0.065, scale: 7.5 },
   // and the rest of the board
@@ -3605,8 +3844,16 @@ async function fetchOddsApi(sports, apiKey, { daysAhead = 2 } = {}) {
         continue;
       }
       const json = await res.json();
-      leagues.push({ key: s.key, league: s.league, sport: s.sport, ok: true, fixtures: json.length });
-      for (const g of json) games.push(normaliseOddsApiGame(g, s));
+      const accepted = [];
+      for (const g of json) {
+        /* `sport_key` is part of the v4 payload. If a response ever contains a
+         * retired sport (a stale proxy, a mislabelled feed, a future mistake in
+         * SPORT_MAP), it stops here rather than becoming a priced leg. */
+        if (isRetiredSport(g?.sport_key) || isRetiredSport(g?.sport)) continue;
+        accepted.push(normaliseOddsApiGame(g, s));
+      }
+      leagues.push({ key: s.key, league: s.league, sport: s.sport, ok: true, fixtures: accepted.length });
+      games.push(...accepted);
     } catch (err) {
       leagues.push({ key: s.key, league: s.league, sport: s.sport, ok: false, status: err?.message || 'network' });
     }
@@ -3661,18 +3908,18 @@ function* enumerate(arr) {
 function mean(a) {
   return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
 }
-__exp_35 = scanForDay;
-__exp_36 = scanDay;
-__exp_37 = scanDayLive;
-__exp_38 = PROVIDERS;
-__exp_39 = fetchOddsApi;
+__exp_42 = scanForDay;
+__exp_43 = scanDay;
+__exp_44 = scanDayLive;
+__exp_45 = PROVIDERS;
+__exp_46 = fetchOddsApi;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/settle.js   →  hoists settleLegs, settleByTruthProb
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_40;
-let __exp_41;
+let __exp_47;
+let __exp_48;
 {
 const simulateResult = __exp_16;
 const makeRng = __exp_8;
@@ -3795,16 +4042,16 @@ function buildEventsFor(dayKey, ctx) {
 async function initSettle() {
   return true;
 }
-__exp_40 = settleLegs;
-__exp_41 = settleByTruthProb;
+__exp_47 = settleLegs;
+__exp_48 = settleByTruthProb;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/suggestions.js   →  hoists suggestNextRun, suggestRecovery, money
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_42;
-let __exp_43;
-let __exp_44;
+let __exp_49;
+let __exp_50;
+let __exp_51;
 {
 const clamp = __exp_6;
 const round = __exp_7;
@@ -4237,21 +4484,14 @@ function money(code, n) {
   const sym = { NGN: '₦', USD: '$', GBP: '£', EUR: '€', GHS: '₵', KES: 'KSh', ZAR: 'R' }[code] || `${code} `;
   return `${sym}${Number(n ?? 0).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
-__exp_42 = suggestNextRun;
-__exp_43 = suggestRecovery;
-__exp_44 = money;
+__exp_49 = suggestNextRun;
+__exp_50 = suggestRecovery;
+__exp_51 = money;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/rollover.js   →  hoists createRun, scanRunDay, confirmDay, settleDay, chooseAlternative, adjustDayOdds, skipDay, rescanDay, abandonRun, restartRun, runProgress, dayCards, equityCurve, RUN_STATUS, DAY_STATUS
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_45;
-let __exp_46;
-let __exp_47;
-let __exp_48;
-let __exp_49;
-let __exp_50;
-let __exp_51;
 let __exp_52;
 let __exp_53;
 let __exp_54;
@@ -4260,20 +4500,27 @@ let __exp_56;
 let __exp_57;
 let __exp_58;
 let __exp_59;
+let __exp_60;
+let __exp_61;
+let __exp_62;
+let __exp_63;
+let __exp_64;
+let __exp_65;
+let __exp_66;
 {
 const makeRng = __exp_8;
 const round = __exp_7;
 const clamp = __exp_6;
 const mean = __exp_10;
-const scanForDay = __exp_35;
-const settleLegs = __exp_40;
+const scanForDay = __exp_42;
+const settleLegs = __exp_47;
 const tzDateKey = __exp_19;
 const tzNowParts = __exp_20;
 const upcomingDays = __exp_22;
 const formatKickoff = __exp_21;
 const zonedTimeToMs = __exp_23;
-const suggestNextRun = __exp_42;
-const suggestRecovery = __exp_43;
+const suggestNextRun = __exp_49;
+const suggestRecovery = __exp_50;
 
 /**
  * rollover.js — the rollover state machine.
@@ -5008,29 +5255,29 @@ const cur = (code) => SYMBOLS[code] || `${code} `;
 const fmt = (n) =>
   Number(n ?? 0).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const money = (code, n) => `${cur(code)}${fmt(n)}`;
-__exp_45 = createRun;
-__exp_46 = scanRunDay;
-__exp_47 = confirmDay;
-__exp_48 = settleDay;
-__exp_49 = chooseAlternative;
-__exp_50 = adjustDayOdds;
-__exp_51 = skipDay;
-__exp_52 = rescanDay;
-__exp_53 = abandonRun;
-__exp_54 = restartRun;
-__exp_55 = runProgress;
-__exp_56 = dayCards;
-__exp_57 = equityCurve;
-__exp_58 = RUN_STATUS;
-__exp_59 = DAY_STATUS;
+__exp_52 = createRun;
+__exp_53 = scanRunDay;
+__exp_54 = confirmDay;
+__exp_55 = settleDay;
+__exp_56 = chooseAlternative;
+__exp_57 = adjustDayOdds;
+__exp_58 = skipDay;
+__exp_59 = rescanDay;
+__exp_60 = abandonRun;
+__exp_61 = restartRun;
+__exp_62 = runProgress;
+__exp_63 = dayCards;
+__exp_64 = equityCurve;
+__exp_65 = RUN_STATUS;
+__exp_66 = DAY_STATUS;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/simulate.js   →  hoists runSimulation, projectRun, STRATEGIES
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_60;
-let __exp_61;
-let __exp_62;
+let __exp_67;
+let __exp_68;
+let __exp_69;
 {
 const makeRng = __exp_8;
 const clamp = __exp_6;
@@ -5045,9 +5292,9 @@ const priceEvent = __exp_28;
 const extractLegs = __exp_30;
 const correlationFactor = __exp_27;
 const applyMarketInformation = __exp_26;
-const buildRolloverSlip = __exp_33;
-const DEFAULT_BUILDER_OPTS = __exp_34;
-const settleByTruthProb = __exp_41;
+const buildRolloverSlip = __exp_40;
+const DEFAULT_BUILDER_OPTS = __exp_41;
+const settleByTruthProb = __exp_48;
 
 /**
  * simulate.js — the honesty machine.
@@ -5522,42 +5769,42 @@ function projectRun({
       : `At ${round(p * 100, 2)}% a day this rollover breaks even or worse. You are paying for variance, not value.`,
   };
 }
-__exp_60 = runSimulation;
-__exp_61 = projectRun;
-__exp_62 = STRATEGIES;
+__exp_67 = runSimulation;
+__exp_68 = projectRun;
+__exp_69 = STRATEGIES;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/http-core.js   →  hoists createApi, ENGINE_INFO, runPayload, dayPayload, projectFor, jsonSafe
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_63;
-let __exp_64;
-let __exp_65;
-let __exp_66;
-let __exp_67;
-let __exp_68;
+let __exp_70;
+let __exp_71;
+let __exp_72;
+let __exp_73;
+let __exp_74;
+let __exp_75;
 {
-const createRun = __exp_45;
-const scanRunDay = __exp_46;
-const confirmDay = __exp_47;
-const settleDay = __exp_48;
-const chooseAlternative = __exp_49;
-const adjustDayOdds = __exp_50;
-const skipDay = __exp_51;
-const rescanDay = __exp_52;
-const abandonRun = __exp_53;
-const restartRun = __exp_54;
-const runProgress = __exp_55;
-const dayCards = __exp_56;
-const equityCurve = __exp_57;
-const scanDay = __exp_36;
-const scanForDay = __exp_35;
-const scanDayLive = __exp_37;
-const PROVIDERS = __exp_38;
-const fetchOddsApi = __exp_39;
+const createRun = __exp_52;
+const scanRunDay = __exp_53;
+const confirmDay = __exp_54;
+const settleDay = __exp_55;
+const chooseAlternative = __exp_56;
+const adjustDayOdds = __exp_57;
+const skipDay = __exp_58;
+const rescanDay = __exp_59;
+const abandonRun = __exp_60;
+const restartRun = __exp_61;
+const runProgress = __exp_62;
+const dayCards = __exp_63;
+const equityCurve = __exp_64;
+const scanDay = __exp_43;
+const scanForDay = __exp_42;
+const scanDayLive = __exp_44;
+const PROVIDERS = __exp_45;
+const fetchOddsApi = __exp_46;
 const SIGNAL_WEIGHTS = __exp_32;
-const runSimulation = __exp_60;
-const projectRun = __exp_61;
+const runSimulation = __exp_67;
+const projectRun = __exp_68;
 const upcomingDays = __exp_22;
 const tzNowParts = __exp_20;
 const tzDateKey = __exp_19;
@@ -5590,7 +5837,7 @@ const tzDateKey = __exp_19;
 
 const ENGINE_INFO = {
   name: 'RolloverEngine',
-  version: '1.1.5',
+  version: '1.1.6',
   signalWeights: SIGNAL_WEIGHTS,
   notes: [
     'Prices are de-vigged across all quoting books before anything else is measured.',
@@ -5838,6 +6085,7 @@ async function livePreparedFor(env, body, settings, dateKey, board) {
         targetOdds: settings.targetOdds,
         tolerance: settings.tolerance,
         mode: settings.mode,
+        preferSports: settings.preferSports,
       },
     });
     return { prepared: { scan: live.scan, builder: live.builder } };
@@ -5938,6 +6186,7 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
           targetOdds: Number(q.get('odds') || settings.targetOdds),
           tolerance: settings.tolerance,
           mode: settings.mode,
+          preferSports: settings.preferSports,
         },
       });
       return {
@@ -5993,7 +6242,12 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
           marketInefficiency: merged.marketInefficiency,
           reservePct: merged.reservePct,
           oddsMode: body.oddsMode || 'exact',
-          builder: { mode: merged.mode, minEdgePerLeg: merged.minEdgePerLeg, maxLegs: merged.maxLegs },
+          builder: {
+            mode: merged.mode,
+            minEdgePerLeg: merged.minEdgePerLeg,
+            maxLegs: merged.maxLegs,
+            preferSports: merged.preferSports,
+          },
         },
       });
       scanRunDay(run, 1, await livePreparedFor(env, body, merged, run.days[0].date, body.liveBoard));
@@ -6166,6 +6420,7 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
             targetOdds: Number(src.odds || settings.targetOdds),
             tolerance: Number(src.tolerance ?? settings.tolerance),
             mode: src.mode || settings.mode,
+            preferSports: settings.preferSports,
           },
         });
         return {
@@ -6216,110 +6471,26 @@ function createApi({ store, env = {}, persistent = true, maxIterations = 5000 } 
     return { status: 404, body: { error: `no route for ${method} ${p}` } };
   };
 }
-__exp_63 = createApi;
-__exp_64 = ENGINE_INFO;
-__exp_65 = runPayload;
-__exp_66 = dayPayload;
-__exp_67 = projectFor;
-__exp_68 = jsonSafe;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
-   lib/store-shared.js   →  hoists DEFAULT_SETTINGS, summariseRun, reviveRun
-   ════════════════════════════════════════════════════════════════════════ */
-let __exp_69;
-let __exp_70;
-let __exp_71;
-{
-/**
- * store-shared.js — the parts of persistence that every backend must agree on.
- *
- * Three storage backends implement the same contract: the flat JSON file
- * (lib/store.js), an in-process object for serverless (lib/memory-store.js) and
- * localStorage in the browser (also lib/memory-store.js). If any of them
- * disagrees about what a run summary looks like or what the default settings
- * are, the same dashboard renders different numbers depending on where it is
- * hosted — which is exactly the kind of quiet inconsistency that makes you
- * distrust a system that is entirely about trustworthy numbers.
- *
- * So the shared definitions live here, in a module with no imports at all. That
- * last part matters: the browser build must be able to bundle this without
- * dragging node:fs in behind it.
- */
-
-/** House defaults. Nigerian Naira, ₦500, 7 days at 2.00, Africa/Lagos. */
-const DEFAULT_SETTINGS = {
-  currency: 'NGN',
-  tz: 'Africa/Lagos',
-  stake: 500,
-  days: 7,
-  targetOdds: 2.0,
-  tolerance: 0.1,
-  mode: 'balanced',
-  provider: 'sim',
-  eventsPerDay: 42,
-  marketInefficiency: 1.3,
-  reservePct: 0,
-  /* The edge floor defaults to 0 on purpose. Positive-edge legs are
-   * disproportionately longshots, so gating the *search* on an edge floor
-   * starves the pool of the short prices needed to build a 2.00 accumulator and
-   * the day silently degrades into one long leg. The win-probability optimiser
-   * lands on +edge legs anyway (around +1.5pp per leg unprompted); the floor is
-   * a reporting number, and the builder relaxes it in tiers when it bites. */
-  minEdgePerLeg: 0,
-  maxLegs: 6,
-  /* Real prices you pasted yourself (SportyBet screenshot transcription, a
-   * telegram tip with numbers, whatever). Empty means "nothing pasted", which
-   * the scan reports as a fallback rather than pretending to use them. */
-  manualOdds: [],
-};
-
-/** What the run list shows. Cheap enough to compute on every read. */
-function summariseRun(r) {
-  const cfg = r.config || {};
-  return {
-    id: r.id,
-    status: r.status,
-    createdAt: r.createdAt,
-    currency: cfg.currency,
-    stake: r.startBalance,
-    balance: r.balance,
-    days: cfg.days,
-    currentDay: r.currentDay,
-    targetOdds: cfg.targetOdds,
-    daysWon: r.stats?.won ?? 0,
-    profit: Math.round((r.balance - r.startBalance) * 100) / 100,
-    headline: r.verdict?.headline ?? null,
-    provider: cfg.provider,
-    startedOn: cfg.startDay,
-  };
-}
-
-/** Runs are persisted as plain JSON, so rehydrate what the engine expects live. */
-function reviveRun(run) {
-  if (!run) return run;
-  for (const d of run.days || []) {
-    if (d.result?.resolved) {
-      for (const r of d.result.resolved) if (r.wonSet) delete r.wonSet;
-    }
-  }
-  return run;
-}
-__exp_69 = DEFAULT_SETTINGS;
-__exp_70 = summariseRun;
-__exp_71 = reviveRun;
+__exp_70 = createApi;
+__exp_71 = ENGINE_INFO;
+__exp_72 = runPayload;
+__exp_73 = dayPayload;
+__exp_74 = projectFor;
+__exp_75 = jsonSafe;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    lib/memory-store.js   →  hoists createLocalStorageStore, createStoreAdapter, createMemoryStore
    ════════════════════════════════════════════════════════════════════════ */
-let __exp_72;
-let __exp_73;
-let __exp_74;
+let __exp_76;
+let __exp_77;
+let __exp_78;
 {
-const DEFAULT_SETTINGS = __exp_69;
-const summariseRun = __exp_70;
-const reviveRun = __exp_71;
+const DEFAULT_SETTINGS = __exp_35;
+const summariseRun = __exp_36;
+const reviveRun = __exp_37;
+const sanitiseSettings = __exp_38;
+const sanitiseSettingsPatch = __exp_39;
 
 /**
  * memory-store.js — a storage adapter with a pluggable backend.
@@ -6446,16 +6617,19 @@ function createStoreAdapter(backend, { oddsApiKey = '', labCap = 40, runCap = 20
 
     async getSettings() {
       const db = load();
-      return {
+      /* This adapter backs both serverless memory and the browser's
+       * localStorage, so this is where an old saved basketball key dies on the
+       * Vercel deployment and on the user's device alike. */
+      return sanitiseSettings({
         ...DEFAULT_SETTINGS,
         oddsApi: { key: oddsApiKey || '', sports: [] },
         ...db.settings,
-      };
+      });
     },
 
     async saveSettings(patch) {
       const db = load();
-      db.settings = { ...(db.settings || {}), ...patch };
+      db.settings = { ...(db.settings || {}), ...sanitiseSettingsPatch(patch) };
       persist(db);
       return this.getSettings();
     },
@@ -6531,12 +6705,12 @@ function createLocalStorageStore(key = 'rolloverengine.store.v1', opts) {
   store.evictions = evictions;
   return store;
 }
-__exp_72 = createLocalStorageStore;
-__exp_73 = createStoreAdapter;
-__exp_74 = createMemoryStore;
+__exp_76 = createLocalStorageStore;
+__exp_77 = createStoreAdapter;
+__exp_78 = createMemoryStore;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
    facade — 44 public bindings
    ════════════════════════════════════════════════════════════════════════ */
-export { __exp_7 as round, __exp_6 as clamp, __exp_10 as mean, __exp_22 as upcomingDays, __exp_19 as tzDateKey, __exp_20 as tzNowParts, __exp_24 as dayShape, __exp_33 as buildRolloverSlip, __exp_34 as DEFAULT_BUILDER_OPTS, __exp_36 as scanDay, __exp_35 as scanForDay, __exp_38 as PROVIDERS, __exp_42 as suggestNextRun, __exp_43 as suggestRecovery, __exp_44 as money, __exp_45 as createRun, __exp_46 as scanRunDay, __exp_47 as confirmDay, __exp_48 as settleDay, __exp_51 as skipDay, __exp_52 as rescanDay, __exp_54 as restartRun, __exp_53 as abandonRun, __exp_49 as chooseAlternative, __exp_50 as adjustDayOdds, __exp_55 as runProgress, __exp_56 as dayCards, __exp_57 as equityCurve, __exp_58 as RUN_STATUS, __exp_59 as DAY_STATUS, __exp_60 as runSimulation, __exp_61 as projectRun, __exp_62 as STRATEGIES, __exp_63 as createApi, __exp_64 as ENGINE_INFO, __exp_65 as runPayload, __exp_66 as dayPayload, __exp_67 as projectFor, __exp_68 as jsonSafe, __exp_69 as DEFAULT_SETTINGS, __exp_70 as summariseRun, __exp_72 as createLocalStorageStore, __exp_73 as createStoreAdapter, __exp_74 as createMemoryStore };
+export { __exp_7 as round, __exp_6 as clamp, __exp_10 as mean, __exp_22 as upcomingDays, __exp_19 as tzDateKey, __exp_20 as tzNowParts, __exp_24 as dayShape, __exp_35 as DEFAULT_SETTINGS, __exp_36 as summariseRun, __exp_40 as buildRolloverSlip, __exp_41 as DEFAULT_BUILDER_OPTS, __exp_43 as scanDay, __exp_42 as scanForDay, __exp_45 as PROVIDERS, __exp_49 as suggestNextRun, __exp_50 as suggestRecovery, __exp_51 as money, __exp_52 as createRun, __exp_53 as scanRunDay, __exp_54 as confirmDay, __exp_55 as settleDay, __exp_58 as skipDay, __exp_59 as rescanDay, __exp_61 as restartRun, __exp_60 as abandonRun, __exp_56 as chooseAlternative, __exp_57 as adjustDayOdds, __exp_62 as runProgress, __exp_63 as dayCards, __exp_64 as equityCurve, __exp_65 as RUN_STATUS, __exp_66 as DAY_STATUS, __exp_67 as runSimulation, __exp_68 as projectRun, __exp_69 as STRATEGIES, __exp_70 as createApi, __exp_71 as ENGINE_INFO, __exp_72 as runPayload, __exp_73 as dayPayload, __exp_74 as projectFor, __exp_75 as jsonSafe, __exp_76 as createLocalStorageStore, __exp_77 as createStoreAdapter, __exp_78 as createMemoryStore };

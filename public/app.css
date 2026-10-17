@@ -292,7 +292,6 @@ input[type="date"].input { color-scheme: dark; }
   padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line-2); color: var(--dim); background: #0d161a;
 }
 .sp-football { color: #6fe3a8; border-color: rgba(111,227,168,.28); }
-.sp-basketball { color: #ffb26f; border-color: rgba(255,178,111,.28); }
 .sp-baseball { color: #6fc7ff; border-color: rgba(111,199,255,.28); }
 .sp-tennis { color: #d9ff6f; border-color: rgba(217,255,111,.26); }
 .sp-mma { color: #ff7b9c; border-color: rgba(255,123,156,.28); }
